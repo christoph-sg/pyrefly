@@ -35,6 +35,7 @@ use dupe::Dupe as _;
 use percent_encoding::AsciiSet;
 use percent_encoding::CONTROLS;
 use percent_encoding::utf8_percent_encode;
+use protobuf::Message as _;
 use pyrefly_build::handle::Handle;
 use pyrefly_config::args::ConfigOverrideArgs;
 use pyrefly_config::base::Preset;
@@ -323,6 +324,9 @@ struct OutputArgs {
     /// Make each module's file the Glean ownership unit of its facts in the Glean report.
     #[arg(long, requires = "report_glean")]
     report_glean_ownership: bool,
+    /// Generate a SCIP index for the project
+    #[arg(long, value_name = "OUTPUT_FILE")]
+    report_scip: Option<PathBuf>,
     /// Generate a Pysa-compatible JSON file for each module
     #[arg(long, value_name = "OUTPUT_FILE")]
     report_pysa: Option<PathBuf>,
@@ -492,6 +496,7 @@ impl OutputArgs {
             report_timings,
             report_glean,
             report_glean_ownership,
+            report_scip,
             report_pysa,
             report_pysa_format,
             report_demand_tree,
@@ -536,6 +541,7 @@ impl OutputArgs {
             || report_timings.is_some()
             || report_glean.is_some()
             || *report_glean_ownership
+            || report_scip.is_some()
             || report_pysa.is_some()
             || !matches!(report_pysa_format, report::pysa::PysaFormat::Capnp)
             || report_demand_tree.is_some()
@@ -1763,7 +1769,8 @@ impl CheckArgs {
         let retain = self.output.report_binding_memory.is_some()
             || self.output.debug_info.is_some()
             || self.output.report_trace.is_some()
-            || self.output.report_glean.is_some();
+            || self.output.report_glean.is_some()
+            || self.output.report_scip.is_some();
         RequireLevels {
             specified: if retain {
                 Require::Everything
@@ -2262,6 +2269,12 @@ impl CheckArgs {
                 )?;
             }
         }
+        if let Some(path) = &self.output.report_scip {
+            fs_anyhow::write(
+                path,
+                report::scip::scip(&relative_to, version).write_to_bytes()?,
+            )?;
+        }
         if let Some(pysa_reporter) = transaction.take_pysa_reporter() {
             report::pysa::write_project_file(&pysa_reporter, transaction, handles, &output_errors)?;
         }
@@ -2546,6 +2559,49 @@ def go(w: Widget) -> int:
             .collect();
         assert_eq!(glean_files.len(), 1, "expected one Glean file per module");
         assert!(fs::metadata(&glean_files[0]).unwrap().len() > 0);
+    }
+
+    #[test]
+    fn check_writes_scip_report() {
+        let temp = TempDir::new().unwrap();
+        let root = temp.path().join("project");
+        fs::create_dir(&root).unwrap();
+        let module = root.join("main.py");
+        fs::write(&module, "x = 1\n").unwrap();
+        let scip_path = temp.path().join("index.scip");
+
+        let args = CheckArgs::parse_from([
+            "check",
+            "--report-scip",
+            scip_path.to_str().unwrap(),
+            "--relative-to",
+            root.to_str().unwrap(),
+        ]);
+        let (status, errors, _) = args
+            .run_once(
+                "test",
+                Box::new(TestIncludes {
+                    root: root.clone(),
+                    initial_files: vec![module],
+                }),
+                test_config_finder(&root),
+                UpsellDecision::Skip,
+                ThreadCount::Inline,
+            )
+            .unwrap();
+        assert!(errors.is_empty(), "unexpected type errors: {errors:#?}");
+        assert!(matches!(status, CommandExitStatus::Success));
+
+        let index = scip::types::Index::parse_from_bytes(&fs::read(&scip_path).unwrap()).unwrap();
+        let metadata = index.metadata.unwrap();
+        assert_eq!(metadata.tool_info.name, "pyrefly");
+        assert_eq!(metadata.tool_info.version, "test");
+        assert!(
+            metadata.project_root.starts_with("file://")
+                && metadata.project_root.ends_with("/project/"),
+            "unexpected project root: {}",
+            metadata.project_root
+        );
     }
 
     #[test]
