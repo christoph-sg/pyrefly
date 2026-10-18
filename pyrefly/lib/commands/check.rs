@@ -2272,7 +2272,14 @@ impl CheckArgs {
         if let Some(path) = &self.output.report_scip {
             fs_anyhow::write(
                 path,
-                report::scip::scip(&relative_to, version).write_to_bytes()?,
+                report::scip::scip(
+                    transaction,
+                    handles,
+                    &relative_to,
+                    &report::scip::Package::default(),
+                    version,
+                )
+                .write_to_bytes()?,
             )?;
         }
         if let Some(pysa_reporter) = transaction.take_pysa_reporter() {
@@ -2593,6 +2600,8 @@ def go(w: Widget) -> int:
         assert!(matches!(status, CommandExitStatus::Success));
 
         let index = scip::types::Index::parse_from_bytes(&fs::read(&scip_path).unwrap()).unwrap();
+        assert_eq!(index.documents.len(), 1);
+        assert_eq!(index.documents[0].relative_path, "main.py");
         let metadata = index.metadata.unwrap();
         assert_eq!(metadata.tool_info.name, "pyrefly");
         assert_eq!(metadata.tool_info.version, "test");
