@@ -1,14 +1,22 @@
 # < definition scip-python python snapshot-util 0.1 `src.single_function`/__init__:
 
 def my_cool_function(a: str) -> str:
+#   ^^^^^^^^^^^^^^^^ definition  snapshot-util 0.1 `src.single_function`/my_cool_function().
+#                    ^ definition  snapshot-util 0.1 `src.single_function`/my_cool_function().(a)
     x = ", world"
+#   ^ definition local 0
     return a + x
 
 def my_cool_function_2(a: str):
+#   ^^^^^^^^^^^^^^^^^^ definition  snapshot-util 0.1 `src.single_function`/my_cool_function_2().
+#                      ^ definition  snapshot-util 0.1 `src.single_function`/my_cool_function_2().(a)
     x = ", world"
+#   ^ definition local 1
     return (lambda y: a + x + y)("oh no")
+#                  ^ definition local 2
 
 def next_level():
+#   ^^^^^^^^^^ definition  snapshot-util 0.1 `src.single_function`/next_level().
     return my_cool_function
 
 my_cool_function("hello")

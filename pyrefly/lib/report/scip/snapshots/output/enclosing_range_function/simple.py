@@ -2,5 +2,7 @@
 
 # format-options: showRanges
 def simple(x):
+#   ^^^^^^ definition  snapshot-util 0.1 simple/simple().
+#          ^ definition  snapshot-util 0.1 simple/simple().(x)
   return x
 

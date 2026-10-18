@@ -2,13 +2,21 @@
 
 # format-options: showRanges
 def decorator(func):
+#   ^^^^^^^^^ definition  snapshot-util 0.1 advanced/decorator().
+#             ^^^^ definition  snapshot-util 0.1 advanced/decorator().(func)
     def wrapper(*args, **kwargs):
+#       ^^^^^^^ definition  snapshot-util 0.1 advanced/decorator().wrapper().
+#                ^^^^ definition  snapshot-util 0.1 advanced/decorator().wrapper().(args)
+#                        ^^^^^^ definition  snapshot-util 0.1 advanced/decorator().wrapper().(kwargs)
         return func(*args, **kwargs)
     return wrapper
 
 @decorator
 def func(x: float) -> float:
+#   ^^^^ definition  snapshot-util 0.1 advanced/func().
+#        ^ definition  snapshot-util 0.1 advanced/func().(x)
     test = x
+#   ^^^^ definition local 0
 
     return test
 

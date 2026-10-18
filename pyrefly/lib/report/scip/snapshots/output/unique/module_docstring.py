@@ -7,5 +7,6 @@ This is a docstring for this module
 """
 
 def x():
+#   ^ definition  snapshot-util 0.1 module_docstring/x().
     return 1
 

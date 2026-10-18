@@ -2,5 +2,6 @@
 
 # format-options: showRanges
 class Test():
+#     ^^^^ definition  snapshot-util 0.1 simple/Test#
   pass
 

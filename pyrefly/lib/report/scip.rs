@@ -9,9 +9,13 @@ use std::path::Path;
 
 use lsp_types::Uri;
 use pyrefly_build::handle::Handle;
+use pyrefly_python::module::Module;
 use pyrefly_python::module_name::ModuleName;
 use pyrefly_util::absolutize::Absolutize;
+use pyrefly_util::lined_buffer::DisplayPos;
+use pyrefly_util::lined_buffer::DisplayRange;
 use pyrefly_util::unix_path::path_to_unix_string;
+use ruff_text_size::TextRange;
 use scip::symbol::format_symbol;
 use scip::types::Descriptor;
 use scip::types::Document;
@@ -25,10 +29,14 @@ use scip::types::TextEncoding;
 use scip::types::ToolInfo;
 use scip::types::descriptor::Suffix;
 
+use crate::report::scip::symbols::ScipSymbol;
+use crate::report::scip::symbols::definitions;
+use crate::report::scip::symbols::descriptor;
 use crate::state::state::Transaction;
 
 #[cfg(test)]
 mod snapshot;
+mod symbols;
 
 const SCHEME: &str = "scip-python";
 const MANAGER: &str = "python";
@@ -80,25 +88,53 @@ fn document(
 ) -> Option<Document> {
     let module = transaction.get_module_info(handle)?;
     let relative_path = module.path().as_path().strip_prefix(project_root).ok()?;
+    let ast = transaction.get_ast(handle)?;
+    let mut occurrences = vec![Occurrence {
+        range: vec![0, 0, 0],
+        symbol: module_symbol(project, module.name()),
+        symbol_roles: SymbolRole::Definition as i32,
+        ..Default::default()
+    }];
+    occurrences.extend(
+        definitions(module.name(), &ast)
+            .into_iter()
+            .map(|(range, symbol)| Occurrence {
+                range: scip_range(&module, range),
+                symbol: format_scip_symbol(project, &symbol),
+                symbol_roles: SymbolRole::Definition as i32,
+                ..Default::default()
+            }),
+    );
     Some(Document {
         language: "python".to_owned(),
         relative_path: path_to_unix_string(relative_path),
-        position_encoding: PositionEncoding::UTF8CodeUnitOffsetFromLineStart.into(),
-        occurrences: vec![Occurrence {
-            range: vec![0, 0, 0],
-            symbol: module_symbol(project, module.name()),
-            symbol_roles: SymbolRole::Definition as i32,
-            ..Default::default()
-        }],
+        position_encoding: PositionEncoding::UTF32CodeUnitOffsetFromLineStart.into(),
+        occurrences,
         ..Default::default()
     })
 }
 
-fn descriptor(name: &str, suffix: Suffix) -> Descriptor {
-    Descriptor {
-        name: name.to_owned(),
-        suffix: suffix.into(),
-        ..Default::default()
+/// A SCIP range: `[line, start, end]` on one line, or `[start line, start, end line, end]`.
+fn scip_range(module: &Module, range: TextRange) -> Vec<i32> {
+    let DisplayRange { start, end } = module.display_range(range);
+    let position = |pos: DisplayPos| {
+        (
+            pos.line_within_file().to_zero_indexed() as i32,
+            pos.column().get() as i32 - 1,
+        )
+    };
+    let ((start_line, start_column), (end_line, end_column)) = (position(start), position(end));
+    if start_line == end_line {
+        vec![start_line, start_column, end_column]
+    } else {
+        vec![start_line, start_column, end_line, end_column]
+    }
+}
+
+fn format_scip_symbol(package: &Package, symbol: &ScipSymbol) -> String {
+    match symbol {
+        ScipSymbol::Global(descriptors) => global_symbol(package, descriptors.clone()),
+        ScipSymbol::Local(id) => format!("local {id}"),
     }
 }
 
@@ -235,6 +271,7 @@ mod tests {
         enclosing_range_function,
         f_string,
         file_from_module_import,
+        graph_1278,
         nameparts_import,
         nested_items,
         odd_pkg_name_1,
