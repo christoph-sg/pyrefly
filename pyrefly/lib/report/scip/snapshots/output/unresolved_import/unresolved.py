@@ -3,6 +3,10 @@
 import this_is_not_real
 
 print(this_is_not_real.x)
+#^^^^ reference  python-stdlib 3.13 builtins/print().
+#     ^^^^^^^^^^^^^^^^ reference local 0
 print(this_is_not_real.x)
+#^^^^ reference  python-stdlib 3.13 builtins/print().
+#     ^^^^^^^^^^^^^^^^ reference local 0
 
 

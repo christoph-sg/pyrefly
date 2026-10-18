@@ -7,5 +7,6 @@ class ClassWithField:
 
     a: int
 #   ^ definition  snapshot-util 0.1 field_docstring/ClassWithField#a.
+#      ^^^ reference  python-stdlib 3.13 builtins/int#
     """Hello world, this is a"""
 

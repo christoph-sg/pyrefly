@@ -20,4 +20,5 @@ class MyClass:
 
 this_class = MyClass()
 #^^^^^^^^^ definition  snapshot-util 0.1 foo/this_class.
+#            ^^^^^^^ reference  snapshot-util 0.1 foo/MyClass#
 

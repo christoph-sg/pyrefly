@@ -5,11 +5,13 @@ class Left:
     def one(self) -> int:
 #       ^^^ definition  snapshot-util 0.1 multiinherits_test/Left#one().
 #           ^^^^ definition  snapshot-util 0.1 multiinherits_test/Left#one().(self)
+#                    ^^^ reference  python-stdlib 3.13 builtins/int#
         return 1
 
     def shared(self) -> bool:
 #       ^^^^^^ definition  snapshot-util 0.1 multiinherits_test/Left#shared().
 #              ^^^^ definition  snapshot-util 0.1 multiinherits_test/Left#shared().(self)
+#                       ^^^^ reference  python-stdlib 3.13 builtins/bool#
         return False
 
 class Right:
@@ -22,13 +24,17 @@ class Right:
     def shared(self) -> bool:
 #       ^^^^^^ definition  snapshot-util 0.1 multiinherits_test/Right#shared().
 #              ^^^^ definition  snapshot-util 0.1 multiinherits_test/Right#shared().(self)
+#                       ^^^^ reference  python-stdlib 3.13 builtins/bool#
         return False
 
 class Multi(Left, Right):
 #     ^^^^^ definition  snapshot-util 0.1 multiinherits_test/Multi#
+#           ^^^^ reference  snapshot-util 0.1 multiinherits_test/Left#
+#                 ^^^^^ reference  snapshot-util 0.1 multiinherits_test/Right#
     def one(self) -> int:
 #       ^^^ definition  snapshot-util 0.1 multiinherits_test/Multi#one().
 #           ^^^^ definition  snapshot-util 0.1 multiinherits_test/Multi#one().(self)
+#                    ^^^ reference  python-stdlib 3.13 builtins/int#
         return 1
 
     def two(self):
@@ -44,5 +50,6 @@ class Multi(Left, Right):
     def shared(self) -> bool:
 #       ^^^^^^ definition  snapshot-util 0.1 multiinherits_test/Multi#shared().
 #              ^^^^ definition  snapshot-util 0.1 multiinherits_test/Multi#shared().(self)
+#                       ^^^^ reference  python-stdlib 3.13 builtins/bool#
         return True
 

@@ -5,6 +5,8 @@ from .foo import this_class
 
 if True:
     exported_function()
+#   ^^^^^^^^^^^^^^^^^ reference  snapshot-util 0.1 foo/exported_function().
 
     this_class.exported_function()
+#   ^^^^^^^^^^ reference  snapshot-util 0.1 foo/this_class.
 

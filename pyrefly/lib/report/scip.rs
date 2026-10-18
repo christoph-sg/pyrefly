@@ -5,17 +5,30 @@
  * LICENSE file in the root directory of this source tree.
  */
 
+use std::collections::HashMap;
 use std::path::Path;
+use std::sync::Arc;
 
+use dupe::Dupe;
 use lsp_types::Uri;
 use pyrefly_build::handle::Handle;
+use pyrefly_python::ast::Ast;
 use pyrefly_python::module::Module;
 use pyrefly_python::module_name::ModuleName;
+use pyrefly_python::module_path::ModulePath;
+use pyrefly_python::module_path::ModulePathDetails;
+use pyrefly_python::symbol_kind::SymbolKind;
+use pyrefly_python::sys_info::SysInfo;
 use pyrefly_util::absolutize::Absolutize;
 use pyrefly_util::fs_anyhow;
 use pyrefly_util::lined_buffer::DisplayPos;
 use pyrefly_util::lined_buffer::DisplayRange;
 use pyrefly_util::unix_path::path_to_unix_string;
+use pyrefly_util::visit::Visit;
+use ruff_python_ast::Expr;
+use ruff_python_ast::ExprContext;
+use ruff_python_ast::ExprName;
+use ruff_python_ast::name::Name;
 use ruff_text_size::TextRange;
 use scip::symbol::format_symbol;
 use scip::types::Descriptor;
@@ -29,11 +42,13 @@ use scip::types::SymbolRole;
 use scip::types::TextEncoding;
 use scip::types::ToolInfo;
 use scip::types::descriptor::Suffix;
+use starlark_map::small_map::SmallMap;
 
 use crate::config::config::ConfigFile;
 use crate::report::scip::symbols::ScipSymbol;
 use crate::report::scip::symbols::definitions;
 use crate::report::scip::symbols::descriptor;
+use crate::state::lsp::FindPreference;
 use crate::state::state::Transaction;
 
 #[cfg(test)]
@@ -87,9 +102,15 @@ pub fn scip(
     version: &str,
 ) -> Index {
     let project_root = project_root.absolutize();
+    let mut indexer = Indexer {
+        transaction,
+        project_root: &project_root,
+        project,
+        definitions: HashMap::new(),
+    };
     let mut documents: Vec<Document> = handles
         .iter()
-        .filter_map(|handle| document(transaction, handle, &project_root, project))
+        .filter_map(|handle| indexer.document(handle))
         .collect();
     documents.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
     Index {
@@ -112,38 +133,141 @@ pub fn scip(
     }
 }
 
-fn document(
-    transaction: &Transaction,
-    handle: &Handle,
-    project_root: &Path,
-    project: &Package,
-) -> Option<Document> {
-    let module = transaction.get_module_info(handle)?;
-    let relative_path = module.path().as_path().strip_prefix(project_root).ok()?;
-    let ast = transaction.get_ast(handle)?;
-    let mut occurrences = vec![Occurrence {
-        range: vec![0, 0, 0],
-        symbol: module_symbol(project, module.name()),
-        symbol_roles: SymbolRole::Definition as i32,
-        ..Default::default()
-    }];
-    occurrences.extend(
-        definitions(module.name(), &ast)
-            .into_iter()
-            .map(|(range, symbol)| Occurrence {
-                range: scip_range(&module, range),
-                symbol: format_scip_symbol(project, &symbol),
-                symbol_roles: SymbolRole::Definition as i32,
+struct Indexer<'a> {
+    transaction: &'a Transaction<'a>,
+    project_root: &'a Path,
+    project: &'a Package,
+    /// The definitions of every module seen so far, keyed by the range of the defining identifier.
+    definitions: HashMap<ModulePath, Arc<SmallMap<TextRange, ScipSymbol>>>,
+}
+
+impl Indexer<'_> {
+    fn document(&mut self, handle: &Handle) -> Option<Document> {
+        let module = self.transaction.get_module_info(handle)?;
+        let relative_path = module
+            .path()
+            .as_path()
+            .strip_prefix(self.project_root)
+            .ok()?;
+        let ast = self.transaction.get_ast(handle)?;
+        let definitions = self.definitions(&module, handle.sys_info().dupe())?;
+        let mut occurrences = vec![Occurrence {
+            range: vec![0, 0, 0],
+            symbol: module_symbol(self.project, module.name()),
+            symbol_roles: SymbolRole::Definition as i32,
+            ..Default::default()
+        }];
+        occurrences.extend(definitions.iter().map(|(range, symbol)| Occurrence {
+            range: scip_range(&module, *range),
+            symbol: format_scip_symbol(self.project, symbol),
+            symbol_roles: SymbolRole::Definition as i32,
+            ..Default::default()
+        }));
+
+        // Names that resolve to no definition get one local per name, numbered after the
+        // module's own locals.
+        let first_unresolved = definitions
+            .values()
+            .filter_map(|symbol| match symbol {
+                ScipSymbol::Local(id) => Some(id + 1),
+                ScipSymbol::Global(_) => None,
+            })
+            .max()
+            .unwrap_or(0);
+        let mut unresolved: SmallMap<Name, usize> = SmallMap::new();
+        let mut names = Vec::new();
+        ast.visit(&mut |x| collect_name_uses(x, &mut names));
+        for name in names {
+            let symbol = self.reference(handle, &module, name).unwrap_or_else(|| {
+                let id = first_unresolved + unresolved.len();
+                format!("local {}", unresolved.entry(name.id.clone()).or_insert(id))
+            });
+            occurrences.push(Occurrence {
+                range: scip_range(&module, name.range),
+                symbol,
                 ..Default::default()
-            }),
-    );
-    Some(Document {
-        language: "python".to_owned(),
-        relative_path: path_to_unix_string(relative_path),
-        position_encoding: PositionEncoding::UTF32CodeUnitOffsetFromLineStart.into(),
-        occurrences,
-        ..Default::default()
-    })
+            });
+        }
+        Some(Document {
+            language: "python".to_owned(),
+            relative_path: path_to_unix_string(relative_path),
+            position_encoding: PositionEncoding::UTF32CodeUnitOffsetFromLineStart.into(),
+            occurrences,
+            ..Default::default()
+        })
+    }
+
+    /// The symbol a name use refers to, or `None` if it has no definition we can name.
+    fn reference(&mut self, handle: &Handle, module: &Module, name: &ExprName) -> Option<String> {
+        let preference = FindPreference {
+            // A call like `C()` refers to the class `C`, not to `C.__init__`.
+            resolve_call_dunders: false,
+            ..Default::default()
+        };
+        let definition = self
+            .transaction
+            .find_definition_for_name_use(
+                handle,
+                &Ast::expr_name_identifier(name.clone()),
+                preference,
+            )
+            .ok()??;
+        let package = self.package(&definition.module, handle.sys_info().dupe());
+        if definition.metadata.symbol_kind() == Some(SymbolKind::Module) {
+            return Some(module_symbol(&package, definition.module.name()));
+        }
+        let symbols = self.definitions(&definition.module, handle.sys_info().dupe())?;
+        match symbols.get(&definition.definition_range)? {
+            ScipSymbol::Global(descriptors) => Some(global_symbol(&package, descriptors.clone())),
+            ScipSymbol::Local(id) => {
+                (definition.module.path() == module.path()).then(|| format!("local {id}"))
+            }
+        }
+    }
+
+    fn definitions(
+        &mut self,
+        module: &Module,
+        sys_info: SysInfo,
+    ) -> Option<Arc<SmallMap<TextRange, ScipSymbol>>> {
+        if let Some(definitions) = self.definitions.get(module.path()) {
+            return Some(definitions.dupe());
+        }
+        let handle = Handle::new(module.name(), module.path().dupe(), sys_info);
+        let ast = self.transaction.get_ast(&handle)?;
+        let table: Arc<SmallMap<_, _>> =
+            Arc::new(definitions(module.name(), &ast).into_iter().collect());
+        self.definitions.insert(module.path().dupe(), table.dupe());
+        Some(table)
+    }
+
+    fn package(&self, module: &Module, sys_info: SysInfo) -> Package {
+        match module.path().details() {
+            ModulePathDetails::BundledTypeshed(_) => {
+                let version = sys_info.version();
+                Package {
+                    name: "python-stdlib".to_owned(),
+                    version: format!("{}.{}", version.major, version.minor),
+                }
+            }
+            _ if module.path().as_path().starts_with(self.project_root) => self.project.clone(),
+            // Without package metadata, name the package after the top-level module.
+            _ => Package {
+                name: module.name().first_component().to_string(),
+                version: String::new(),
+            },
+        }
+    }
+}
+
+/// Collects every name that is read or deleted, in source order.
+fn collect_name_uses<'a>(x: &'a Expr, names: &mut Vec<&'a ExprName>) {
+    if let Expr::Name(name) = x
+        && name.ctx != ExprContext::Store
+    {
+        names.push(name);
+    }
+    x.recurse(&mut |x| collect_name_uses(x, names));
 }
 
 /// A SCIP range: `[line, start, end]` on one line, or `[start line, start, end line, end]`.
@@ -200,8 +324,6 @@ fn module_symbol(package: &Package, module: ModuleName) -> String {
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
-
-    use pyrefly_python::module_path::ModulePath;
 
     use super::*;
     use crate::report::scip::snapshot::format_snapshot;
