@@ -327,6 +327,12 @@ struct OutputArgs {
     /// Generate a SCIP index for the project
     #[arg(long, value_name = "OUTPUT_FILE")]
     report_scip: Option<PathBuf>,
+    /// Package name for the project's symbols in the SCIP index. Defaults to the name in `pyproject.toml`.
+    #[arg(long, requires = "report_scip")]
+    report_scip_project_name: Option<String>,
+    /// Package version for the project's symbols in the SCIP index. Defaults to the version in `pyproject.toml`.
+    #[arg(long, requires = "report_scip")]
+    report_scip_project_version: Option<String>,
     /// Generate a Pysa-compatible JSON file for each module
     #[arg(long, value_name = "OUTPUT_FILE")]
     report_pysa: Option<PathBuf>,
@@ -497,6 +503,8 @@ impl OutputArgs {
             report_glean,
             report_glean_ownership,
             report_scip,
+            report_scip_project_name,
+            report_scip_project_version,
             report_pysa,
             report_pysa_format,
             report_demand_tree,
@@ -542,6 +550,8 @@ impl OutputArgs {
             || report_glean.is_some()
             || *report_glean_ownership
             || report_scip.is_some()
+            || report_scip_project_name.is_some()
+            || report_scip_project_version.is_some()
             || report_pysa.is_some()
             || !matches!(report_pysa_format, report::pysa::PysaFormat::Capnp)
             || report_demand_tree.is_some()
@@ -2276,7 +2286,11 @@ impl CheckArgs {
                     transaction,
                     handles,
                     &relative_to,
-                    &report::scip::Package::default(),
+                    &report::scip::Package::project(
+                        &relative_to,
+                        self.output.report_scip_project_name.clone(),
+                        self.output.report_scip_project_version.clone(),
+                    )?,
                     version,
                 )
                 .write_to_bytes()?,
@@ -2581,6 +2595,8 @@ def go(w: Widget) -> int:
             "check",
             "--report-scip",
             scip_path.to_str().unwrap(),
+            "--report-scip-project-name",
+            "demo",
             "--relative-to",
             root.to_str().unwrap(),
         ]);
@@ -2602,6 +2618,10 @@ def go(w: Widget) -> int:
         let index = scip::types::Index::parse_from_bytes(&fs::read(&scip_path).unwrap()).unwrap();
         assert_eq!(index.documents.len(), 1);
         assert_eq!(index.documents[0].relative_path, "main.py");
+        assert_eq!(
+            index.documents[0].occurrences[0].symbol,
+            "scip-python python demo . main/__init__:"
+        );
         let metadata = index.metadata.unwrap();
         assert_eq!(metadata.tool_info.name, "pyrefly");
         assert_eq!(metadata.tool_info.version, "test");

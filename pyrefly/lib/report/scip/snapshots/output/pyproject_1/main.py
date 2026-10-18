@@ -1,7 +1,7 @@
-# < definition scip-python python snapshot-util 0.1 main/__init__:
+# < definition scip-python python abc 16.05 main/__init__:
 
 def main():
-#   ^^^^ definition  snapshot-util 0.1 main/main().
+#   ^^^^ definition  abc 16.05 main/main().
     pass
 
 main()

@@ -12,6 +12,7 @@ use pyrefly_build::handle::Handle;
 use pyrefly_python::module::Module;
 use pyrefly_python::module_name::ModuleName;
 use pyrefly_util::absolutize::Absolutize;
+use pyrefly_util::fs_anyhow;
 use pyrefly_util::lined_buffer::DisplayPos;
 use pyrefly_util::lined_buffer::DisplayRange;
 use pyrefly_util::unix_path::path_to_unix_string;
@@ -29,6 +30,7 @@ use scip::types::TextEncoding;
 use scip::types::ToolInfo;
 use scip::types::descriptor::Suffix;
 
+use crate::config::config::ConfigFile;
 use crate::report::scip::symbols::ScipSymbol;
 use crate::report::scip::symbols::definitions;
 use crate::report::scip::symbols::descriptor;
@@ -41,10 +43,40 @@ mod symbols;
 const SCHEME: &str = "scip-python";
 const MANAGER: &str = "python";
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct Package {
     pub name: String,
     pub version: String,
+}
+
+impl Package {
+    /// The package of the project's own symbols. Explicit values come first, then `[project]`
+    /// and `[tool.poetry]` in the project root's `pyproject.toml`.
+    pub fn project(
+        project_root: &Path,
+        name: Option<String>,
+        version: Option<String>,
+    ) -> anyhow::Result<Self> {
+        let pyproject = project_root.join(ConfigFile::PYPROJECT_FILE_NAME);
+        let pyproject: toml::Table = if (name.is_none() || version.is_none()) && pyproject.exists()
+        {
+            fs_anyhow::read_to_string(&pyproject)?.parse()?
+        } else {
+            toml::Table::new()
+        };
+        let lookup = |key: &str| {
+            let poetry = pyproject.get("tool").and_then(|tool| tool.get("poetry"));
+            [pyproject.get("project"), poetry]
+                .into_iter()
+                .flatten()
+                .find_map(|table| Some(table.get(key)?.as_str()?.to_owned()))
+        };
+        // An empty name or version is written as `.` in symbols.
+        Ok(Self {
+            name: name.or_else(|| lookup("name")).unwrap_or_default(),
+            version: version.or_else(|| lookup("version")).unwrap_or_default(),
+        })
+    }
 }
 
 pub fn scip(
@@ -170,7 +202,6 @@ mod tests {
     use std::path::PathBuf;
 
     use pyrefly_python::module_path::ModulePath;
-    use pyrefly_util::fs_anyhow;
 
     use super::*;
     use crate::report::scip::snapshot::format_snapshot;
@@ -183,16 +214,20 @@ mod tests {
         std::env::current_dir().unwrap().join(path)
     }
 
+    /// A test case uses its own `pyproject.toml` when it has one.
     fn project_package(snapshots: &Path, case: &str) -> Package {
         let info: serde_json::Value = serde_json::from_str(
             &fs_anyhow::read_to_string(&snapshots.join("packageInfo.json")).unwrap(),
         )
         .unwrap();
-        let package = info["special"].get(case).unwrap_or(&info["default"]);
-        Package {
-            name: package["name"].as_str().unwrap().to_owned(),
-            version: package["version"].as_str().unwrap().to_owned(),
-        }
+        let input_dir = snapshots.join("input").join(case);
+        let package = match info["special"].get(case) {
+            Some(package) => Some(package),
+            None if input_dir.join(ConfigFile::PYPROJECT_FILE_NAME).exists() => None,
+            None => Some(&info["default"]),
+        };
+        let field = |key: &str| package.map(|package| package[key].as_str().unwrap().to_owned());
+        Package::project(&input_dir, field("name"), field("version")).unwrap()
     }
 
     fn assert_snapshot(case: &str) {
