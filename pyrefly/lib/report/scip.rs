@@ -165,11 +165,20 @@ impl Indexer<'_> {
             symbol_roles: SymbolRole::Definition as i32,
             ..Default::default()
         }];
-        occurrences.extend(definitions.iter().map(|(range, symbol)| Occurrence {
-            range: scip_range(&module, *range),
-            symbol: format_scip_symbol(self.project, symbol),
-            symbol_roles: SymbolRole::Definition as i32,
-            ..Default::default()
+        let mut enclosing_ranges = SmallMap::new();
+        ast.body
+            .iter()
+            .for_each(|x| collect_enclosing_ranges(x, &mut enclosing_ranges));
+        occurrences.extend(definitions.iter().map(|(range, symbol)| {
+            Occurrence {
+                range: scip_range(&module, *range),
+                symbol: format_scip_symbol(self.project, symbol),
+                symbol_roles: SymbolRole::Definition as i32,
+                enclosing_range: enclosing_ranges
+                    .get(range)
+                    .map_or_else(Vec::new, |x| scip_range(&module, *x)),
+                ..Default::default()
+            }
         }));
 
         // Names that resolve to no definition get one local per name, numbered after the
@@ -395,6 +404,16 @@ fn collect_expr_uses(x: &Expr, uses: &mut Vec<Use>) {
         _ => {}
     }
     x.recurse(&mut |x| collect_expr_uses(x, uses));
+}
+
+/// Maps the name of every function and class to its whole definition, decorators included.
+fn collect_enclosing_ranges(x: &Stmt, ranges: &mut SmallMap<TextRange, TextRange>) {
+    match x {
+        Stmt::FunctionDef(x) => ranges.insert(x.name.range, x.range),
+        Stmt::ClassDef(x) => ranges.insert(x.name.range, x.range),
+        _ => None,
+    };
+    x.recurse(&mut |x| collect_enclosing_ranges(x, ranges));
 }
 
 /// Collects the module and name identifiers of every import statement.
