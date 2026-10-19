@@ -6,4 +6,7 @@ import foo.bar.baz.mod
 print(foo.bar.baz.mod.SuchNestedMuchWow)
 #^^^^ reference  python-stdlib 3.13 builtins/print().
 #     ^^^ reference  snapshot-util 0.1 foo/__init__:
+#         ^^^ reference  snapshot-util 0.1 `foo.bar`/__init__:
+#                 ^^^ reference  snapshot-util 0.1 `foo.bar.baz.mod`/__init__:
+#                     ^^^^^^^^^^^^^^^^^ reference  snapshot-util 0.1 `foo.bar.baz.mod`/SuchNestedMuchWow#
 

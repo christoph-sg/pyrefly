@@ -17,12 +17,14 @@ class X:
         for x in self.items:
 #           ^ definition local 0
 #                ^^^^ reference  snapshot-util 0.1 vars_inside_scopes/X#my_func().(self)
+#                     ^^^^^ reference  snapshot-util 0.1 vars_inside_scopes/X#items.
             y = x + 1
 #           ^ definition local 1
 #               ^ reference local 0
 
         if 5 in self.items:
 #               ^^^^ reference  snapshot-util 0.1 vars_inside_scopes/X#my_func().(self)
+#                    ^^^^^ reference  snapshot-util 0.1 vars_inside_scopes/X#items.
             z = "oh ya"
 #           ^ definition local 2
 

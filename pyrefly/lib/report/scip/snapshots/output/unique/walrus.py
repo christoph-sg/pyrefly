@@ -22,11 +22,13 @@ if (n := len(some_list)) > 10:
 if (match := re.search(pattern, text)) is not None:
 #   ^^^^^ definition  snapshot-util 0.1 walrus/match.
 #            ^^ reference  python-stdlib 3.13 re/__init__:
+#               ^^^^^^ reference  python-stdlib 3.13 re/search().
 #                      ^^^^^^^ reference  snapshot-util 0.1 walrus/pattern.
 #                               ^^^^ reference  snapshot-util 0.1 walrus/text.
     print("Found match:", match.group(0))
 #   ^^^^^ reference  python-stdlib 3.13 builtins/print().
 #                         ^^^^^ reference  snapshot-util 0.1 walrus/match.
+#                               ^^^^^ reference  python-stdlib 3.13 re/Match#group().
 
 
 # comprehensions

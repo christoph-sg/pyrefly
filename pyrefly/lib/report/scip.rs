@@ -184,14 +184,21 @@ impl Indexer<'_> {
             .unwrap_or(0);
         let mut unresolved: SmallMap<Name, usize> = SmallMap::new();
         let mut uses = Vec::new();
-        ast.visit(&mut |x| collect_name_uses(x, &mut uses));
+        ast.visit(&mut |x| collect_expr_uses(x, &mut uses));
         ast.body.iter().for_each(|x| collect_imports(x, &mut uses));
+        // The first `self.x = ...` of an attribute is its definition, not a use.
+        uses.retain(|x| !definitions.contains_key(&x.range));
         uses.sort_by_key(|x| x.range.start());
         for x in uses {
-            let symbol = self.reference(handle, &module, &x).unwrap_or_else(|| {
-                let id = first_unresolved + unresolved.len();
-                format!("local {}", unresolved.entry(x.identifier.id).or_insert(id))
-            });
+            let symbol = match (self.reference(handle, &module, &x), x.kind) {
+                (Some(symbol), _) => symbol,
+                (None, UseKind::Name | UseKind::Import) => {
+                    let id = first_unresolved + unresolved.len();
+                    format!("local {}", unresolved.entry(x.identifier.id).or_insert(id))
+                }
+                // An unresolved attribute or keyword isn't a variable, so it gets no local.
+                (None, UseKind::Attribute | UseKind::Keyword) => continue,
+            };
             occurrences.push(Occurrence {
                 range: scip_range(&module, x.range),
                 symbol,
@@ -214,22 +221,27 @@ impl Indexer<'_> {
             resolve_call_dunders: false,
             ..Default::default()
         };
-        let definition = if x.import {
-            // At the identifier's last character, a dotted module name resolves to the whole
-            // module rather than to its first component.
-            let position = x.identifier.range.end() - TextSize::from(1);
-            let definitions = self
+        let definition = match x.kind {
+            UseKind::Name => self
                 .transaction
-                .find_definition(handle, position, preference)
-                .ok()?;
-            definitions.into_iter().next()
-        } else {
-            self.transaction
                 .find_definition_for_name_use(handle, &x.identifier, preference)
-                .ok()?
+                .ok()?,
+            UseKind::Import | UseKind::Attribute | UseKind::Keyword => {
+                // At the identifier's last character, a dotted module name in an import resolves
+                // to the whole module rather than to its first component.
+                let position = x.identifier.range.end() - TextSize::from(1);
+                let definitions = self
+                    .transaction
+                    .find_definition(handle, position, preference)
+                    .ok()?;
+                definitions.into_iter().next()
+            }
         }?;
         let package = self.package(&definition.module, handle.sys_info().dupe());
-        if definition.metadata.symbol_kind() == Some(SymbolKind::Module) {
+        // A submodule accessed as an attribute resolves to the empty range at the module's start.
+        if definition.metadata.symbol_kind() == Some(SymbolKind::Module)
+            || definition.definition_range.is_empty()
+        {
             return Some(module_symbol(&package, definition.module.name()));
         }
         let symbols = self.definitions(&definition.module, handle.sys_info().dupe())?;
@@ -345,22 +357,44 @@ struct Use {
     /// The range of the occurrence. For a relative module, it also covers the leading dots.
     range: TextRange,
     identifier: Identifier,
-    /// Whether the name is part of an import statement, rather than an expression.
-    import: bool,
+    kind: UseKind,
 }
 
-/// Collects every name that is read or deleted.
-fn collect_name_uses(x: &Expr, uses: &mut Vec<Use>) {
-    if let Expr::Name(name) = x
-        && name.ctx != ExprContext::Store
-    {
+#[derive(Clone, Copy)]
+enum UseKind {
+    /// A name in an expression.
+    Name,
+    /// A module or name in an import statement.
+    Import,
+    Attribute,
+    /// The name of a keyword argument in a call.
+    Keyword,
+}
+
+/// Collects every name that is read or deleted, every attribute, and every keyword argument.
+fn collect_expr_uses(x: &Expr, uses: &mut Vec<Use>) {
+    let mut push = |identifier: Identifier, kind| {
         uses.push(Use {
-            range: name.range,
-            identifier: Ast::expr_name_identifier(name.clone()),
-            import: false,
-        });
+            range: identifier.range,
+            identifier,
+            kind,
+        })
+    };
+    match x {
+        Expr::Name(name) if name.ctx != ExprContext::Store => {
+            push(Ast::expr_name_identifier(name.clone()), UseKind::Name)
+        }
+        Expr::Attribute(attribute) => push(attribute.attr.clone(), UseKind::Attribute),
+        Expr::Call(call) => {
+            for keyword in call.arguments.keywords.iter() {
+                if let Some(arg) = &keyword.arg {
+                    push(arg.clone(), UseKind::Keyword);
+                }
+            }
+        }
+        _ => {}
     }
-    x.recurse(&mut |x| collect_name_uses(x, uses));
+    x.recurse(&mut |x| collect_expr_uses(x, uses));
 }
 
 /// Collects the module and name identifiers of every import statement.
@@ -369,7 +403,7 @@ fn collect_imports(x: &Stmt, uses: &mut Vec<Use>) {
         uses.push(Use {
             range,
             identifier: identifier.clone(),
-            import: true,
+            kind: UseKind::Import,
         })
     };
     let aliases = match x {

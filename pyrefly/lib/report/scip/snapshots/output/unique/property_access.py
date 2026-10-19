@@ -36,4 +36,5 @@ def usage(xs: Sequence[PropertyClass]):
             print(x.prop_ref)
 #           ^^^^^ reference  python-stdlib 3.13 builtins/print().
 #                 ^ reference local 0
+#                   ^^^^^^^^ reference  snapshot-util 0.1 property_access/PropertyClass#prop_ref().
 

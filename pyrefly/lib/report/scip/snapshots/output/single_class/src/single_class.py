@@ -27,11 +27,14 @@ class ExampleClass:
 
         self.a = a
 #       ^^^^ reference  snapshot-util 0.1 single_class/ExampleClass#__init__().(self)
+#            ^ reference  snapshot-util 0.1 single_class/ExampleClass#a.
 #                ^ reference  snapshot-util 0.1 single_class/ExampleClass#__init__().(a)
         self.b = b
 #       ^^^^ reference  snapshot-util 0.1 single_class/ExampleClass#__init__().(self)
+#            ^ reference  snapshot-util 0.1 single_class/ExampleClass#b.
 #                ^ reference  snapshot-util 0.1 single_class/ExampleClass#__init__().(b)
         self.c = "hello" + local_c
 #       ^^^^ reference  snapshot-util 0.1 single_class/ExampleClass#__init__().(self)
+#            ^ reference  snapshot-util 0.1 single_class/ExampleClass#c.
 #                          ^^^^^^^ reference local 0
 

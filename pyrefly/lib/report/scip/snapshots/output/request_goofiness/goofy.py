@@ -6,4 +6,5 @@ import requests
 print(requests.get("https://sourcegraph.com"))
 #^^^^ reference  python-stdlib 3.13 builtins/print().
 #     ^^^^^^^^ reference  requests 2.0.0 requests/__init__:
+#              ^^^ reference  requests 2.0.0 `requests.api`/get().
 

@@ -19,9 +19,12 @@ class Example:
 #                ^^^^^^ reference  snapshot-util 0.1 class_nohint/Example#__init__().(in_val)
         self.x = self.x + 1
 #       ^^^^ reference  snapshot-util 0.1 class_nohint/Example#__init__().(self)
+#            ^ reference  snapshot-util 0.1 class_nohint/Example#x.
 #                ^^^^ reference  snapshot-util 0.1 class_nohint/Example#__init__().(self)
+#                     ^ reference  snapshot-util 0.1 class_nohint/Example#x.
         self.y = in_val
 #       ^^^^ reference  snapshot-util 0.1 class_nohint/Example#__init__().(self)
+#            ^ reference  snapshot-util 0.1 class_nohint/Example#y.
 #                ^^^^^^ reference  snapshot-util 0.1 class_nohint/Example#__init__().(in_val)
 
     def something(self):
@@ -30,7 +33,9 @@ class Example:
         print(self.x)
 #       ^^^^^ reference  python-stdlib 3.13 builtins/print().
 #             ^^^^ reference  snapshot-util 0.1 class_nohint/Example#something().(self)
+#                  ^ reference  snapshot-util 0.1 class_nohint/Example#x.
         print(self.y)
 #       ^^^^^ reference  python-stdlib 3.13 builtins/print().
 #             ^^^^ reference  snapshot-util 0.1 class_nohint/Example#something().(self)
+#                  ^ reference  snapshot-util 0.1 class_nohint/Example#y.
 

@@ -35,4 +35,5 @@ class Test:
 #                     ^^^^^ reference  python-stdlib 3.13 builtins/float#
         return self.x
 #              ^^^^ reference  snapshot-util 0.1 advanced/Test#test().(self)
+#                   ^ reference  snapshot-util 0.1 advanced/Test#x.
 
