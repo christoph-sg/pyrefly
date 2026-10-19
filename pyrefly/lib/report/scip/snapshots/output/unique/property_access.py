@@ -1,6 +1,8 @@
 # < definition scip-python python snapshot-util 0.1 property_access/__init__:
 
 from typing import Sequence
+#    ^^^^^^ reference  python-stdlib 3.13 typing/__init__:
+#                  ^^^^^^^^ reference  python-stdlib 3.13 typing/Sequence#
 
 class PropertyClass:
 #     ^^^^^^^^^^^^^ definition  snapshot-util 0.1 property_access/PropertyClass#

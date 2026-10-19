@@ -1,6 +1,12 @@
 # < definition scip-python python snapshot-util 0.1 mwe/__init__:
 
 from typing import TypeVar, Generic, Callable, Iterator, ParamSpec
+#    ^^^^^^ reference  python-stdlib 3.13 typing/__init__:
+#                  ^^^^^^^ reference  python-stdlib 3.13 typing/TypeVar#
+#                           ^^^^^^^ reference  python-stdlib 3.13 typing/Generic.
+#                                    ^^^^^^^^ reference  python-stdlib 3.13 typing/Callable.
+#                                              ^^^^^^^^ reference  python-stdlib 3.13 typing/Iterator#
+#                                                        ^^^^^^^^^ reference  python-stdlib 3.13 typing/ParamSpec#
 
 _T_co = TypeVar("_T_co")
 #^^^^ definition  snapshot-util 0.1 mwe/_T_co.

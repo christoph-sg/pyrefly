@@ -6,7 +6,9 @@
  */
 
 use std::collections::HashMap;
+use std::iter;
 use std::path::Path;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use dupe::Dupe;
@@ -27,9 +29,12 @@ use pyrefly_util::unix_path::path_to_unix_string;
 use pyrefly_util::visit::Visit;
 use ruff_python_ast::Expr;
 use ruff_python_ast::ExprContext;
-use ruff_python_ast::ExprName;
+use ruff_python_ast::Identifier;
+use ruff_python_ast::Stmt;
 use ruff_python_ast::name::Name;
+use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
+use ruff_text_size::TextSize;
 use scip::symbol::format_symbol;
 use scip::types::Descriptor;
 use scip::types::Document;
@@ -107,6 +112,7 @@ pub fn scip(
         project_root: &project_root,
         project,
         definitions: HashMap::new(),
+        distributions: HashMap::new(),
     };
     let mut documents: Vec<Document> = handles
         .iter()
@@ -138,7 +144,9 @@ struct Indexer<'a> {
     project_root: &'a Path,
     project: &'a Package,
     /// The definitions of every module seen so far, keyed by the range of the defining identifier.
-    definitions: HashMap<ModulePath, Arc<SmallMap<TextRange, ScipSymbol>>>,
+    definitions: HashMap<(ModuleName, ModulePath), Arc<SmallMap<TextRange, ScipSymbol>>>,
+    /// The installed distributions of every site-packages directory seen so far.
+    distributions: HashMap<PathBuf, HashMap<Name, Package>>,
 }
 
 impl Indexer<'_> {
@@ -175,15 +183,17 @@ impl Indexer<'_> {
             .max()
             .unwrap_or(0);
         let mut unresolved: SmallMap<Name, usize> = SmallMap::new();
-        let mut names = Vec::new();
-        ast.visit(&mut |x| collect_name_uses(x, &mut names));
-        for name in names {
-            let symbol = self.reference(handle, &module, name).unwrap_or_else(|| {
+        let mut uses = Vec::new();
+        ast.visit(&mut |x| collect_name_uses(x, &mut uses));
+        ast.body.iter().for_each(|x| collect_imports(x, &mut uses));
+        uses.sort_by_key(|x| x.range.start());
+        for x in uses {
+            let symbol = self.reference(handle, &module, &x).unwrap_or_else(|| {
                 let id = first_unresolved + unresolved.len();
-                format!("local {}", unresolved.entry(name.id.clone()).or_insert(id))
+                format!("local {}", unresolved.entry(x.identifier.id).or_insert(id))
             });
             occurrences.push(Occurrence {
-                range: scip_range(&module, name.range),
+                range: scip_range(&module, x.range),
                 symbol,
                 ..Default::default()
             });
@@ -197,21 +207,27 @@ impl Indexer<'_> {
         })
     }
 
-    /// The symbol a name use refers to, or `None` if it has no definition we can name.
-    fn reference(&mut self, handle: &Handle, module: &Module, name: &ExprName) -> Option<String> {
+    /// The symbol a use refers to, or `None` if it has no definition we can name.
+    fn reference(&mut self, handle: &Handle, module: &Module, x: &Use) -> Option<String> {
         let preference = FindPreference {
             // A call like `C()` refers to the class `C`, not to `C.__init__`.
             resolve_call_dunders: false,
             ..Default::default()
         };
-        let definition = self
-            .transaction
-            .find_definition_for_name_use(
-                handle,
-                &Ast::expr_name_identifier(name.clone()),
-                preference,
-            )
-            .ok()??;
+        let definition = if x.import {
+            // At the identifier's last character, a dotted module name resolves to the whole
+            // module rather than to its first component.
+            let position = x.identifier.range.end() - TextSize::from(1);
+            let definitions = self
+                .transaction
+                .find_definition(handle, position, preference)
+                .ok()?;
+            definitions.into_iter().next()
+        } else {
+            self.transaction
+                .find_definition_for_name_use(handle, &x.identifier, preference)
+                .ok()?
+        }?;
         let package = self.package(&definition.module, handle.sys_info().dupe());
         if definition.metadata.symbol_kind() == Some(SymbolKind::Module) {
             return Some(module_symbol(&package, definition.module.name()));
@@ -230,18 +246,19 @@ impl Indexer<'_> {
         module: &Module,
         sys_info: SysInfo,
     ) -> Option<Arc<SmallMap<TextRange, ScipSymbol>>> {
-        if let Some(definitions) = self.definitions.get(module.path()) {
+        let key = (module.name(), module.path().dupe());
+        if let Some(definitions) = self.definitions.get(&key) {
             return Some(definitions.dupe());
         }
         let handle = Handle::new(module.name(), module.path().dupe(), sys_info);
         let ast = self.transaction.get_ast(&handle)?;
         let table: Arc<SmallMap<_, _>> =
             Arc::new(definitions(module.name(), &ast).into_iter().collect());
-        self.definitions.insert(module.path().dupe(), table.dupe());
+        self.definitions.insert(key, table.dupe());
         Some(table)
     }
 
-    fn package(&self, module: &Module, sys_info: SysInfo) -> Package {
+    fn package(&mut self, module: &Module, sys_info: SysInfo) -> Package {
         match module.path().details() {
             ModulePathDetails::BundledTypeshed(_) => {
                 let version = sys_info.version();
@@ -251,23 +268,129 @@ impl Indexer<'_> {
                 }
             }
             _ if module.path().as_path().starts_with(self.project_root) => self.project.clone(),
-            // Without package metadata, name the package after the top-level module.
-            _ => Package {
-                name: module.name().first_component().to_string(),
-                version: String::new(),
-            },
+            _ => {
+                // Match by top-level module, so that bundled stubs get the installed package too.
+                let top_level = module.name().first_component();
+                let handle = Handle::new(module.name(), module.path().dupe(), sys_info);
+                let config = self.transaction.get_config(&handle);
+                config
+                    .iter()
+                    .flat_map(|config| config.site_package_path())
+                    .find_map(|root| {
+                        self.distributions
+                            .entry(root.clone())
+                            .or_insert_with(|| distributions(root))
+                            .get(&top_level)
+                            .cloned()
+                    })
+                    // Without package metadata, name the package after the top-level module.
+                    .unwrap_or_else(|| Package {
+                        name: top_level.to_string(),
+                        version: String::new(),
+                    })
+            }
         }
     }
 }
 
-/// Collects every name that is read or deleted, in source order.
-fn collect_name_uses<'a>(x: &'a Expr, names: &mut Vec<&'a ExprName>) {
+/// The distributions installed in a site-packages directory, keyed by each top-level module they
+/// installed. A distribution whose metadata can't be read is left out.
+fn distributions(site_packages: &Path) -> HashMap<Name, Package> {
+    let mut modules = HashMap::new();
+    let pattern = site_packages.join("*.dist-info");
+    for dist_info in glob::glob(&pattern.to_string_lossy())
+        .into_iter()
+        .flatten()
+        .flatten()
+    {
+        let (Ok(metadata), Ok(record)) = (
+            fs_anyhow::read_to_string(&dist_info.join("METADATA")),
+            fs_anyhow::read_to_string(&dist_info.join("RECORD")),
+        ) else {
+            continue;
+        };
+        // The header fields end at the first blank line.
+        let field = |key: &str| {
+            metadata
+                .lines()
+                .take_while(|line| !line.is_empty())
+                .find_map(|line| Some(line.strip_prefix(key)?.strip_prefix(':')?.trim().to_owned()))
+        };
+        let (Some(name), Some(version)) = (field("Name"), field("Version")) else {
+            continue;
+        };
+        let package = Package { name, version };
+        // Each RECORD line is a CSV row whose first column is the installed file. Its first path
+        // component, up to the first `.`, names a top-level module (or a `-stubs` package), unless
+        // it isn't an identifier, as for the `.dist-info` directory itself.
+        for line in record.lines() {
+            let component = line.split(['/', ',']).next().unwrap_or_default();
+            let module = component
+                .split('.')
+                .next()
+                .unwrap_or_default()
+                .trim_end_matches("-stubs");
+            if !module.is_empty() && module.chars().all(|c| c.is_alphanumeric() || c == '_') {
+                modules
+                    .entry(Name::new(module))
+                    .or_insert_with(|| package.clone());
+            }
+        }
+    }
+    modules
+}
+
+/// A name that refers to a definition elsewhere.
+struct Use {
+    /// The range of the occurrence. For a relative module, it also covers the leading dots.
+    range: TextRange,
+    identifier: Identifier,
+    /// Whether the name is part of an import statement, rather than an expression.
+    import: bool,
+}
+
+/// Collects every name that is read or deleted.
+fn collect_name_uses(x: &Expr, uses: &mut Vec<Use>) {
     if let Expr::Name(name) = x
         && name.ctx != ExprContext::Store
     {
-        names.push(name);
+        uses.push(Use {
+            range: name.range,
+            identifier: Ast::expr_name_identifier(name.clone()),
+            import: false,
+        });
     }
-    x.recurse(&mut |x| collect_name_uses(x, names));
+    x.recurse(&mut |x| collect_name_uses(x, uses));
+}
+
+/// Collects the module and name identifiers of every import statement.
+fn collect_imports(x: &Stmt, uses: &mut Vec<Use>) {
+    let mut import = |range, identifier: &Identifier| {
+        uses.push(Use {
+            range,
+            identifier: identifier.clone(),
+            import: true,
+        })
+    };
+    let aliases = match x {
+        Stmt::Import(x) => &x.names,
+        Stmt::ImportFrom(x) => {
+            if let Some(module) = &x.module {
+                let dots = TextSize::from(x.level);
+                import(TextRange::new(module.start() - dots, module.end()), module);
+            }
+            &x.names
+        }
+        _ => {
+            x.recurse(&mut |x| collect_imports(x, uses));
+            return;
+        }
+    };
+    for alias in aliases.iter().filter(|alias| alias.name.as_str() != "*") {
+        for identifier in iter::once(&alias.name).chain(&alias.asname) {
+            import(identifier.range, identifier);
+        }
+    }
 }
 
 /// A SCIP range: `[line, start, end]` on one line, or `[start line, start, end line, end]`.
@@ -323,8 +446,6 @@ fn module_symbol(package: &Package, module: ModuleName) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
-
     use super::*;
     use crate::report::scip::snapshot::format_snapshot;
     use crate::state::require::Require;
@@ -361,8 +482,12 @@ mod tests {
         let mut handles = Vec::new();
         for path in glob::glob(&format!("{}/**/*.py", input_dir.display())).unwrap() {
             let path = path.unwrap();
-            let name =
-                ModuleName::from_relative_path(path.strip_prefix(&input_dir).unwrap()).unwrap();
+            // As with an import root, modules under `src/` are named without the prefix.
+            let relative = path
+                .strip_prefix(input_dir.join("src"))
+                .or_else(|_| path.strip_prefix(&input_dir))
+                .unwrap();
+            let name = ModuleName::from_relative_path(relative).unwrap();
             env.add_real_path(name.as_str(), path.clone());
             handles.push(Handle::new(
                 name,
@@ -371,6 +496,7 @@ mod tests {
             ));
         }
         let (state, _) = env
+            .with_site_package_paths(vec![snapshots.join("site-packages")])
             .with_default_require_level(Require::Everything)
             .to_state();
         let index = scip(
@@ -434,6 +560,7 @@ mod tests {
         odd_pkg_name_1,
         pyproject_1,
         relative_import,
+        request_goofiness,
         single_class,
         single_function,
         unique,

@@ -1,6 +1,7 @@
 # < definition scip-python python snapshot-util 0.1 walrus/__init__:
 
 import re
+#      ^^ reference  python-stdlib 3.13 re/__init__:
 
 some_list = [1, 2, 3, 4, 5, 100, 1000]
 #^^^^^^^^ definition  snapshot-util 0.1 walrus/some_list.

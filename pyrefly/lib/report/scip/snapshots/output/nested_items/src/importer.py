@@ -1,15 +1,20 @@
-# < definition scip-python python snapshot-util 0.1 `src.importer`/__init__:
+# < definition scip-python python snapshot-util 0.1 importer/__init__:
 
 from foo.bar import InitClass
+#    ^^^^^^^ reference  snapshot-util 0.1 `foo.bar`/__init__:
+#                   ^^^^^^^^^ reference  snapshot-util 0.1 `foo.bar`/InitClass#
 from foo.bar.baz.mod import SuchNestedMuchWow, AnotherNestedMuchWow
+#    ^^^^^^^^^^^^^^^ reference  snapshot-util 0.1 `foo.bar.baz.mod`/__init__:
+#                           ^^^^^^^^^^^^^^^^^ reference  snapshot-util 0.1 `foo.bar.baz.mod`/SuchNestedMuchWow#
+#                                              ^^^^^^^^^^^^^^^^^^^^ reference  snapshot-util 0.1 `foo.bar.baz.mod`/AnotherNestedMuchWow#
 
 print(SuchNestedMuchWow().class_item)
 #^^^^ reference  python-stdlib 3.13 builtins/print().
-#     ^^^^^^^^^^^^^^^^^ reference local 0
+#     ^^^^^^^^^^^^^^^^^ reference  snapshot-util 0.1 `foo.bar.baz.mod`/SuchNestedMuchWow#
 print(AnotherNestedMuchWow().other_item)
 #^^^^ reference  python-stdlib 3.13 builtins/print().
-#     ^^^^^^^^^^^^^^^^^^^^ reference local 1
+#     ^^^^^^^^^^^^^^^^^^^^ reference  snapshot-util 0.1 `foo.bar.baz.mod`/AnotherNestedMuchWow#
 print(InitClass().init_item)
 #^^^^ reference  python-stdlib 3.13 builtins/print().
-#     ^^^^^^^^^ reference local 2
+#     ^^^^^^^^^ reference  snapshot-util 0.1 `foo.bar`/InitClass#
 
