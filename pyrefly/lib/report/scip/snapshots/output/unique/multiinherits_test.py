@@ -29,16 +29,20 @@ class Right:
 
 class Multi(Left, Right):
 #     ^^^^^ definition  snapshot-util 0.1 multiinherits_test/Multi#
+#     relationship implementation scip-python python snapshot-util 0.1 multiinherits_test/Left#
+#     relationship implementation scip-python python snapshot-util 0.1 multiinherits_test/Right#
 #           ^^^^ reference  snapshot-util 0.1 multiinherits_test/Left#
 #                 ^^^^^ reference  snapshot-util 0.1 multiinherits_test/Right#
     def one(self) -> int:
 #       ^^^ definition  snapshot-util 0.1 multiinherits_test/Multi#one().
+#       relationship implementation scip-python python snapshot-util 0.1 multiinherits_test/Left#one().
 #           ^^^^ definition  snapshot-util 0.1 multiinherits_test/Multi#one().(self)
 #                    ^^^ reference  python-stdlib 3.13 builtins/int#
         return 1
 
     def two(self):
 #       ^^^ definition  snapshot-util 0.1 multiinherits_test/Multi#two().
+#       relationship implementation scip-python python snapshot-util 0.1 multiinherits_test/Right#two().
 #           ^^^^ definition  snapshot-util 0.1 multiinherits_test/Multi#two().(self)
         return 2
 
@@ -49,6 +53,7 @@ class Multi(Left, Right):
 
     def shared(self) -> bool:
 #       ^^^^^^ definition  snapshot-util 0.1 multiinherits_test/Multi#shared().
+#       relationship implementation scip-python python snapshot-util 0.1 multiinherits_test/Left#shared().
 #              ^^^^ definition  snapshot-util 0.1 multiinherits_test/Multi#shared().(self)
 #                       ^^^^ reference  python-stdlib 3.13 builtins/bool#
         return True

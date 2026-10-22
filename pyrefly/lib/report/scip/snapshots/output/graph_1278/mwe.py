@@ -17,6 +17,7 @@ _P = ParamSpec("_P")
 
 class X(Generic[_T_co]):
 #     ^ definition  snapshot-util 0.1 mwe/X#
+#     relationship implementation scip-python python python-stdlib 3.13 typing/Generic.
 #       ^^^^^^^ reference  python-stdlib 3.13 typing/Generic.
 #               ^^^^^ reference  snapshot-util 0.1 mwe/_T_co.
     pass
@@ -50,9 +51,11 @@ def noop():
 
 class FooImpl(Foo):
 #     ^^^^^^^ definition  snapshot-util 0.1 mwe/FooImpl#
+#     relationship implementation scip-python python snapshot-util 0.1 mwe/Foo#
 #             ^^^ reference  snapshot-util 0.1 mwe/Foo#
     def foo(self):
 #       ^^^ definition  snapshot-util 0.1 mwe/FooImpl#foo().
+#       relationship implementation scip-python python snapshot-util 0.1 mwe/Foo#foo().
 #           ^^^^ definition  snapshot-util 0.1 mwe/FooImpl#foo().(self)
         return noop()
 #              ^^^^ reference  snapshot-util 0.1 mwe/noop().

@@ -31,6 +31,7 @@ use ruff_python_ast::Expr;
 use ruff_python_ast::ExprContext;
 use ruff_python_ast::Identifier;
 use ruff_python_ast::Stmt;
+use ruff_python_ast::StmtClassDef;
 use ruff_python_ast::name::Name;
 use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
@@ -42,7 +43,9 @@ use scip::types::Index;
 use scip::types::Metadata;
 use scip::types::Occurrence;
 use scip::types::PositionEncoding;
+use scip::types::Relationship;
 use scip::types::Symbol;
+use scip::types::SymbolInformation;
 use scip::types::SymbolRole;
 use scip::types::TextEncoding;
 use scip::types::ToolInfo;
@@ -53,6 +56,7 @@ use crate::config::config::ConfigFile;
 use crate::report::scip::symbols::ScipSymbol;
 use crate::report::scip::symbols::definitions;
 use crate::report::scip::symbols::descriptor;
+use crate::state::lsp::FindDefinitionItemWithDocstring;
 use crate::state::lsp::FindPreference;
 use crate::state::state::Transaction;
 
@@ -214,22 +218,99 @@ impl Indexer<'_> {
                 ..Default::default()
             });
         }
+        let mut classes = Vec::new();
+        ast.body
+            .iter()
+            .for_each(|x| collect_classes(x, &mut classes));
+        let mut symbols = Vec::new();
+        for class in classes {
+            for (range, implemented) in self.implementations(handle, &module, class) {
+                let Some(symbol) = definitions.get(&range) else {
+                    continue;
+                };
+                symbols.push(SymbolInformation {
+                    symbol: format_scip_symbol(self.project, symbol),
+                    relationships: implemented
+                        .into_iter()
+                        .map(|symbol| Relationship {
+                            symbol,
+                            is_implementation: true,
+                            ..Default::default()
+                        })
+                        .collect(),
+                    ..Default::default()
+                });
+            }
+        }
         Some(Document {
             language: "python".to_owned(),
             relative_path: path_to_unix_string(relative_path),
             position_encoding: PositionEncoding::UTF32CodeUnitOffsetFromLineStart.into(),
             occurrences,
+            symbols,
             ..Default::default()
         })
     }
 
+    /// The symbols that a class and its methods implement, keyed by the range of the defining
+    /// name. A class implements each of its bases, and a method implements the first method of
+    /// the same name found through the bases, in order. A method whose name starts with `__`
+    /// implements nothing.
+    fn implementations(
+        &mut self,
+        handle: &Handle,
+        module: &Module,
+        class: &StmtClassDef,
+    ) -> Vec<(TextRange, Vec<String>)> {
+        let bases: Vec<Use> = class
+            .bases()
+            .iter()
+            .filter_map(|base| {
+                let base = match base {
+                    Expr::Subscript(x) => &*x.value,
+                    x => x,
+                };
+                let (identifier, kind) = match base {
+                    Expr::Name(x) => (Ast::expr_name_identifier(x.clone()), UseKind::Name),
+                    Expr::Attribute(x) => (x.attr.clone(), UseKind::Attribute),
+                    _ => return None,
+                };
+                Some(Use {
+                    range: base.range(),
+                    identifier,
+                    kind,
+                })
+            })
+            .collect();
+        let class_bases: Vec<_> = bases
+            .iter()
+            .filter_map(|base| self.reference(handle, module, base))
+            .collect();
+        let mut implementations = vec![(class.name.range, class_bases)];
+        for x in &class.body {
+            let Stmt::FunctionDef(method) = x else {
+                continue;
+            };
+            let name = &method.name.id;
+            if name.starts_with("__") {
+                continue;
+            }
+            let implemented = bases.iter().find_map(|base| {
+                let definitions = self
+                    .transaction
+                    .find_definition_for_attribute(handle, base.range, name, preference())
+                    .ok()?;
+                self.symbol(handle, module, definitions.into_iter().next()?)
+            });
+            implementations.push((method.name.range, implemented.into_iter().collect()));
+        }
+        implementations.retain(|(_, implemented)| !implemented.is_empty());
+        implementations
+    }
+
     /// The symbol a use refers to, or `None` if it has no definition we can name.
     fn reference(&mut self, handle: &Handle, module: &Module, x: &Use) -> Option<String> {
-        let preference = FindPreference {
-            // A call like `C()` refers to the class `C`, not to `C.__init__`.
-            resolve_call_dunders: false,
-            ..Default::default()
-        };
+        let preference = preference();
         let definition = match x.kind {
             UseKind::Name => self
                 .transaction
@@ -246,6 +327,17 @@ impl Indexer<'_> {
                 definitions.into_iter().next()
             }
         }?;
+        self.symbol(handle, module, definition)
+    }
+
+    /// The symbol of a definition, or `None` if it is a local of another module or has no
+    /// definition we can name.
+    fn symbol(
+        &mut self,
+        handle: &Handle,
+        module: &Module,
+        definition: FindDefinitionItemWithDocstring,
+    ) -> Option<String> {
         let package = self.package(&definition.module, handle.sys_info().dupe());
         // A submodule accessed as an attribute resolves to the empty range at the module's start.
         if definition.metadata.symbol_kind() == Some(SymbolKind::Module)
@@ -404,6 +496,22 @@ fn collect_expr_uses(x: &Expr, uses: &mut Vec<Use>) {
         _ => {}
     }
     x.recurse(&mut |x| collect_expr_uses(x, uses));
+}
+
+fn preference() -> FindPreference {
+    FindPreference {
+        // A call like `C()` refers to the class `C`, not to `C.__init__`.
+        resolve_call_dunders: false,
+        ..Default::default()
+    }
+}
+
+/// Collects every class definition, including nested ones.
+fn collect_classes<'a>(x: &'a Stmt, classes: &mut Vec<&'a StmtClassDef>) {
+    if let Stmt::ClassDef(x) = x {
+        classes.push(x);
+    }
+    x.recurse(&mut |x| collect_classes(x, classes));
 }
 
 /// Maps the name of every function and class to its whole definition, decorators included.
