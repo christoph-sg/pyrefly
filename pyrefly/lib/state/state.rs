@@ -958,6 +958,15 @@ impl<'a> Transaction<'a> {
         self.with_module_inner(handle, |x| x.get_ast())
     }
 
+    /// Run `op` on the state's thread pool, which has an increased stack size.
+    pub fn install<OP, R>(&self, op: OP) -> R
+    where
+        OP: FnOnce() -> R + Send,
+        R: Send,
+    {
+        self.data.state.threads.install(op)
+    }
+
     pub(crate) fn get_parsed_module(&self, handle: &Handle) -> Option<Arc<ParsedModule>> {
         self.with_module_inner(handle, |x| x.get_parsed_module())
     }

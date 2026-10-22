@@ -6,7 +6,9 @@
  */
 
 use std::collections::HashMap;
+use std::io::Write;
 use std::iter;
+use std::mem;
 use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -15,6 +17,7 @@ use dupe::Dupe;
 use lsp_types::Contents;
 use lsp_types::Hover;
 use lsp_types::Uri;
+use protobuf::Message as _;
 use pyrefly_build::handle::Handle;
 use pyrefly_python::ast::Ast;
 use pyrefly_python::docstring::Docstring;
@@ -28,8 +31,10 @@ use pyrefly_util::absolutize::Absolutize;
 use pyrefly_util::fs_anyhow;
 use pyrefly_util::lined_buffer::DisplayPos;
 use pyrefly_util::lined_buffer::DisplayRange;
+use pyrefly_util::lock::Mutex;
 use pyrefly_util::unix_path::path_to_unix_string;
 use pyrefly_util::visit::Visit;
+use rayon::prelude::*;
 use ruff_python_ast::Expr;
 use ruff_python_ast::ExprContext;
 use ruff_python_ast::Identifier;
@@ -109,38 +114,26 @@ impl Package {
     }
 }
 
-pub fn scip(
+/// Writes a SCIP index as a stream of `Index` messages, which a reader merges into one: the
+/// metadata, then each document as soon as it is built, in no particular order, then the
+/// external symbols.
+pub fn write_scip(
+    writer: &mut (impl Write + Send),
     transaction: &Transaction,
     handles: &[Handle],
     project_root: &Path,
     project: &Package,
     version: &str,
-) -> Index {
+) -> anyhow::Result<()> {
     let project_root = project_root.absolutize();
-    let mut indexer = Indexer {
+    let indexer = Indexer {
         transaction,
         project_root: &project_root,
         project,
-        definitions: HashMap::new(),
-        distributions: HashMap::new(),
-        external_symbols: HashMap::new(),
+        definitions: Mutex::new(HashMap::new()),
+        distributions: Mutex::new(HashMap::new()),
+        external_symbols: Mutex::new(HashMap::new()),
     };
-    let mut documents: Vec<Document> = handles
-        .iter()
-        .filter_map(|handle| indexer.document(handle))
-        .collect();
-    documents.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
-    let mut external_symbols: Vec<SymbolInformation> = indexer
-        .external_symbols
-        .into_iter()
-        .filter(|(_, documentation)| !documentation.is_empty())
-        .map(|(symbol, documentation)| SymbolInformation {
-            symbol,
-            documentation,
-            ..Default::default()
-        })
-        .collect();
-    external_symbols.sort_by(|a, b| a.symbol.cmp(&b.symbol));
     Index {
         metadata: Some(Metadata {
             project_root: Uri::from_directory_path(&project_root)
@@ -156,10 +149,47 @@ pub fn scip(
             ..Default::default()
         })
         .into(),
-        documents,
+        ..Default::default()
+    }
+    .write_to_writer(writer)?;
+    let documents_writer = Mutex::new(&mut *writer);
+    transaction.install(|| {
+        handles.par_iter().try_for_each(|handle| {
+            let Some(document) = indexer.document(handle) else {
+                return anyhow::Ok(());
+            };
+            let bytes = Index {
+                documents: vec![document],
+                ..Default::default()
+            }
+            .write_to_bytes()?;
+            documents_writer.lock().write_all(&bytes)?;
+            Ok(())
+        })
+    })?;
+    let first_uses: Vec<_> = mem::take(&mut *indexer.external_symbols.lock())
+        .into_iter()
+        .collect();
+    let mut external_symbols: Vec<SymbolInformation> = transaction.install(|| {
+        first_uses
+            .into_par_iter()
+            .filter_map(|(symbol, first_use)| {
+                let documentation = indexer.documentation(&first_use.handle, first_use.position);
+                (!documentation.is_empty()).then_some(SymbolInformation {
+                    symbol,
+                    documentation,
+                    ..Default::default()
+                })
+            })
+            .collect()
+    });
+    external_symbols.sort_by(|a, b| a.symbol.cmp(&b.symbol));
+    Index {
         external_symbols,
         ..Default::default()
     }
+    .write_to_writer(writer)?;
+    Ok(())
 }
 
 struct Indexer<'a> {
@@ -167,15 +197,23 @@ struct Indexer<'a> {
     project_root: &'a Path,
     project: &'a Package,
     /// The definitions of every module seen so far, keyed by the range of the defining identifier.
-    definitions: HashMap<(ModuleName, ModulePath), Arc<SmallMap<TextRange, ScipSymbol>>>,
+    definitions: Mutex<HashMap<(ModuleName, ModulePath), Arc<SmallMap<TextRange, ScipSymbol>>>>,
     /// The installed distributions of every site-packages directory seen so far.
-    distributions: HashMap<PathBuf, HashMap<Name, Package>>,
-    /// The documentation of every symbol defined outside the project and referenced so far.
-    external_symbols: HashMap<String, Vec<String>>,
+    distributions: Mutex<HashMap<PathBuf, Arc<HashMap<Name, Package>>>>,
+    /// The first use, in path and position order, of every symbol defined outside the project and
+    /// referenced so far. The symbol is documented with the hover there, so its documentation
+    /// doesn't depend on the order documents are built in.
+    external_symbols: Mutex<HashMap<String, ExternalUse>>,
+}
+
+struct ExternalUse {
+    relative_path: PathBuf,
+    position: TextSize,
+    handle: Handle,
 }
 
 impl Indexer<'_> {
-    fn document(&mut self, handle: &Handle) -> Option<Document> {
+    fn document(&self, handle: &Handle) -> Option<Document> {
         let module = self.transaction.get_module_info(handle)?;
         let relative_path = module
             .path()
@@ -226,9 +264,26 @@ impl Indexer<'_> {
         for x in uses {
             let symbol = match (self.reference(handle, &module, &x), x.kind) {
                 (Some((symbol, external)), _) => {
-                    if external && !self.external_symbols.contains_key(&symbol) {
-                        let documentation = self.documentation(handle, use_position(&x));
-                        self.external_symbols.insert(symbol.clone(), documentation);
+                    if external {
+                        let position = use_position(&x);
+                        let mut external_symbols = self.external_symbols.lock();
+                        let first_use =
+                            external_symbols
+                                .entry(symbol.clone())
+                                .or_insert_with(|| ExternalUse {
+                                    relative_path: relative_path.to_owned(),
+                                    position,
+                                    handle: handle.dupe(),
+                                });
+                        if (relative_path, position)
+                            < (first_use.relative_path.as_path(), first_use.position)
+                        {
+                            *first_use = ExternalUse {
+                                relative_path: relative_path.to_owned(),
+                                position,
+                                handle: handle.dupe(),
+                            };
+                        }
                     }
                     symbol
                 }
@@ -315,7 +370,7 @@ impl Indexer<'_> {
     /// the same name found through the bases, in order. A method whose name starts with `__`
     /// implements nothing.
     fn implementations(
-        &mut self,
+        &self,
         handle: &Handle,
         module: &Module,
         class: &StmtClassDef,
@@ -393,7 +448,7 @@ impl Indexer<'_> {
 
     /// The symbol a use refers to, and whether it is defined outside the project, or `None` if
     /// it has no definition we can name.
-    fn reference(&mut self, handle: &Handle, module: &Module, x: &Use) -> Option<(String, bool)> {
+    fn reference(&self, handle: &Handle, module: &Module, x: &Use) -> Option<(String, bool)> {
         let preference = preference();
         let definition = match x.kind {
             UseKind::Name => self
@@ -414,7 +469,7 @@ impl Indexer<'_> {
     /// The symbol of a definition, and whether it is defined outside the project, or `None` if
     /// it is a local of another module or has no definition we can name.
     fn symbol(
-        &mut self,
+        &self,
         handle: &Handle,
         module: &Module,
         definition: FindDefinitionItemWithDocstring,
@@ -443,23 +498,23 @@ impl Indexer<'_> {
     }
 
     fn definitions(
-        &mut self,
+        &self,
         module: &Module,
         sys_info: SysInfo,
     ) -> Option<Arc<SmallMap<TextRange, ScipSymbol>>> {
         let key = (module.name(), module.path().dupe());
-        if let Some(definitions) = self.definitions.get(&key) {
+        if let Some(definitions) = self.definitions.lock().get(&key) {
             return Some(definitions.dupe());
         }
         let handle = Handle::new(module.name(), module.path().dupe(), sys_info);
         let ast = self.transaction.get_ast(&handle)?;
         let table: Arc<SmallMap<_, _>> =
             Arc::new(definitions(module.name(), &ast).into_iter().collect());
-        self.definitions.insert(key, table.dupe());
+        self.definitions.lock().insert(key, table.dupe());
         Some(table)
     }
 
-    fn package(&mut self, module: &Module, sys_info: SysInfo) -> Package {
+    fn package(&self, module: &Module, sys_info: SysInfo) -> Package {
         match module.path().details() {
             ModulePathDetails::BundledTypeshed(_) => {
                 let version = sys_info.version();
@@ -478,11 +533,13 @@ impl Indexer<'_> {
                     .iter()
                     .flat_map(|config| config.site_package_path())
                     .find_map(|root| {
-                        self.distributions
+                        let installed = self
+                            .distributions
+                            .lock()
                             .entry(root.clone())
-                            .or_insert_with(|| distributions(root))
-                            .get(&top_level)
-                            .cloned()
+                            .or_insert_with(|| Arc::new(distributions(root)))
+                            .dupe();
+                        installed.get(&top_level).cloned()
                     })
                     // Without package metadata, name the package after the top-level module.
                     .unwrap_or_else(|| Package {
@@ -701,8 +758,6 @@ fn module_symbol(package: &Package, module: ModuleName) -> String {
 
 #[cfg(test)]
 mod tests {
-    use protobuf::Message as _;
-
     use super::*;
     use crate::report::scip::snapshot::format_snapshot;
     use crate::state::require::Require;
@@ -754,13 +809,17 @@ mod tests {
             .with_site_package_paths(vec![snapshots.join("site-packages")])
             .with_default_require_level(Require::Everything)
             .to_state();
-        scip(
+        let mut bytes = Vec::new();
+        write_scip(
+            &mut bytes,
             &state.transaction(),
             &handles,
             &input_dir,
             &project_package(&snapshots, case),
             "test",
         )
+        .unwrap();
+        Index::parse_from_bytes(&bytes).unwrap()
     }
 
     fn assert_snapshot(case: &str) {
@@ -796,9 +855,7 @@ mod tests {
     #[test]
     fn external_symbols_are_deduplicated() {
         // `print` and `int` are each referenced more than once.
-        let bytes = index("class_nohint").write_to_bytes().unwrap();
-        let symbols: Vec<String> = Index::parse_from_bytes(&bytes)
-            .unwrap()
+        let symbols: Vec<String> = index("class_nohint")
             .external_symbols
             .into_iter()
             .map(|x| x.symbol)

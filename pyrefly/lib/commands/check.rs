@@ -35,7 +35,6 @@ use dupe::Dupe as _;
 use percent_encoding::AsciiSet;
 use percent_encoding::CONTROLS;
 use percent_encoding::utf8_percent_encode;
-use protobuf::Message as _;
 use pyrefly_build::handle::Handle;
 use pyrefly_config::args::ConfigOverrideArgs;
 use pyrefly_config::base::Preset;
@@ -2280,21 +2279,22 @@ impl CheckArgs {
             }
         }
         if let Some(path) = &self.output.report_scip {
-            fs_anyhow::write(
-                path,
-                report::scip::scip(
-                    transaction,
-                    handles,
-                    &relative_to,
-                    &report::scip::Package::project(
-                        &relative_to,
-                        self.output.report_scip_project_name.clone(),
-                        self.output.report_scip_project_version.clone(),
-                    )?,
-                    version,
-                )
-                .write_to_bytes()?,
+            let project = report::scip::Package::project(
+                &relative_to,
+                self.output.report_scip_project_name.clone(),
+                self.output.report_scip_project_version.clone(),
             )?;
+            let mut writer = BufWriter::new(File::create(path)?);
+            report::scip::write_scip(
+                &mut writer,
+                transaction,
+                handles,
+                &relative_to,
+                &project,
+                version,
+            )
+            .and_then(|()| Ok(writer.flush()?))
+            .with_context(|| format!("while writing SCIP index to `{}`", path.display()))?;
         }
         if let Some(pysa_reporter) = transaction.take_pysa_reporter() {
             report::pysa::write_project_file(&pysa_reporter, transaction, handles, &output_errors)?;
@@ -2346,6 +2346,7 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::Arc;
 
+    use protobuf::Message as _;
     use pyrefly_config::config::ConfigScope;
     use pyrefly_python::module::Module;
     use pyrefly_python::module_name::ModuleName;
