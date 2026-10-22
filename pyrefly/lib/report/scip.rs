@@ -12,9 +12,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use dupe::Dupe;
+use lsp_types::Contents;
+use lsp_types::Hover;
 use lsp_types::Uri;
 use pyrefly_build::handle::Handle;
 use pyrefly_python::ast::Ast;
+use pyrefly_python::docstring::Docstring;
 use pyrefly_python::module::Module;
 use pyrefly_python::module_name::ModuleName;
 use pyrefly_python::module_path::ModulePath;
@@ -53,6 +56,9 @@ use scip::types::descriptor::Suffix;
 use starlark_map::small_map::SmallMap;
 
 use crate::config::config::ConfigFile;
+use crate::lsp::wasm::hover::HoverOptions;
+use crate::lsp::wasm::hover::HoverResult;
+use crate::lsp::wasm::hover::get_hover_with_verbosity;
 use crate::report::scip::symbols::ScipSymbol;
 use crate::report::scip::symbols::definitions;
 use crate::report::scip::symbols::descriptor;
@@ -117,12 +123,24 @@ pub fn scip(
         project,
         definitions: HashMap::new(),
         distributions: HashMap::new(),
+        external_symbols: HashMap::new(),
     };
     let mut documents: Vec<Document> = handles
         .iter()
         .filter_map(|handle| indexer.document(handle))
         .collect();
     documents.sort_by(|a, b| a.relative_path.cmp(&b.relative_path));
+    let mut external_symbols: Vec<SymbolInformation> = indexer
+        .external_symbols
+        .into_iter()
+        .filter(|(_, documentation)| !documentation.is_empty())
+        .map(|(symbol, documentation)| SymbolInformation {
+            symbol,
+            documentation,
+            ..Default::default()
+        })
+        .collect();
+    external_symbols.sort_by(|a, b| a.symbol.cmp(&b.symbol));
     Index {
         metadata: Some(Metadata {
             project_root: Uri::from_directory_path(&project_root)
@@ -139,6 +157,7 @@ pub fn scip(
         })
         .into(),
         documents,
+        external_symbols,
         ..Default::default()
     }
 }
@@ -151,6 +170,8 @@ struct Indexer<'a> {
     definitions: HashMap<(ModuleName, ModulePath), Arc<SmallMap<TextRange, ScipSymbol>>>,
     /// The installed distributions of every site-packages directory seen so far.
     distributions: HashMap<PathBuf, HashMap<Name, Package>>,
+    /// The documentation of every symbol defined outside the project and referenced so far.
+    external_symbols: HashMap<String, Vec<String>>,
 }
 
 impl Indexer<'_> {
@@ -204,7 +225,13 @@ impl Indexer<'_> {
         uses.sort_by_key(|x| x.range.start());
         for x in uses {
             let symbol = match (self.reference(handle, &module, &x), x.kind) {
-                (Some(symbol), _) => symbol,
+                (Some((symbol, external)), _) => {
+                    if external && !self.external_symbols.contains_key(&symbol) {
+                        let documentation = self.documentation(handle, use_position(&x));
+                        self.external_symbols.insert(symbol.clone(), documentation);
+                    }
+                    symbol
+                }
                 (None, UseKind::Name | UseKind::Import) => {
                     let id = first_unresolved + unresolved.len();
                     format!("local {}", unresolved.entry(x.identifier.id).or_insert(id))
@@ -218,30 +245,61 @@ impl Indexer<'_> {
                 ..Default::default()
             });
         }
+        // A symbol defined more than once is documented at its first definition.
+        let mut symbols: SmallMap<String, SymbolInformation> = SmallMap::new();
+        let mut module_documentation = format!("```python\n(module) {}\n```", module.name());
+        if let Some(range) = Docstring::range_from_stmts(&ast.body) {
+            module_documentation.push_str("\n---\n");
+            module_documentation.push_str(Docstring(range, module.dupe()).resolve().trim());
+        }
+        let module_symbol = module_symbol(self.project, module.name());
+        symbols.insert(
+            module_symbol.clone(),
+            SymbolInformation {
+                symbol: module_symbol,
+                documentation: vec![module_documentation],
+                ..Default::default()
+            },
+        );
+        for (range, symbol) in definitions.iter() {
+            let symbol = format_scip_symbol(self.project, symbol);
+            if !symbols.contains_key(&symbol) {
+                let documentation = self.documentation(handle, range.start());
+                symbols.insert(
+                    symbol.clone(),
+                    SymbolInformation {
+                        symbol,
+                        documentation,
+                        ..Default::default()
+                    },
+                );
+            }
+        }
         let mut classes = Vec::new();
         ast.body
             .iter()
             .for_each(|x| collect_classes(x, &mut classes));
-        let mut symbols = Vec::new();
         for class in classes {
             for (range, implemented) in self.implementations(handle, &module, class) {
                 let Some(symbol) = definitions.get(&range) else {
                     continue;
                 };
-                symbols.push(SymbolInformation {
-                    symbol: format_scip_symbol(self.project, symbol),
-                    relationships: implemented
+                if let Some(info) = symbols.get_mut(&format_scip_symbol(self.project, symbol)) {
+                    info.relationships = implemented
                         .into_iter()
                         .map(|symbol| Relationship {
                             symbol,
                             is_implementation: true,
                             ..Default::default()
                         })
-                        .collect(),
-                    ..Default::default()
-                });
+                        .collect();
+                }
             }
         }
+        let symbols = symbols
+            .into_values()
+            .filter(|info| !info.documentation.is_empty() || !info.relationships.is_empty())
+            .collect();
         Some(Document {
             language: "python".to_owned(),
             relative_path: path_to_unix_string(relative_path),
@@ -284,7 +342,10 @@ impl Indexer<'_> {
             .collect();
         let class_bases: Vec<_> = bases
             .iter()
-            .filter_map(|base| self.reference(handle, module, base))
+            .filter_map(|base| {
+                self.reference(handle, module, base)
+                    .map(|(symbol, _)| symbol)
+            })
             .collect();
         let mut implementations = vec![(class.name.range, class_bases)];
         for x in &class.body {
@@ -300,7 +361,9 @@ impl Indexer<'_> {
                     .transaction
                     .find_definition_for_attribute(handle, base.range, name, preference())
                     .ok()?;
-                self.symbol(handle, module, definitions.into_iter().next()?)
+                let definition = definitions.into_iter().next()?;
+                self.symbol(handle, module, definition)
+                    .map(|(symbol, _)| symbol)
             });
             implementations.push((method.name.range, implemented.into_iter().collect()));
         }
@@ -308,8 +371,29 @@ impl Indexer<'_> {
         implementations
     }
 
-    /// The symbol a use refers to, or `None` if it has no definition we can name.
-    fn reference(&mut self, handle: &Handle, module: &Module, x: &Use) -> Option<String> {
+    /// The hover text at a position, as SCIP documentation.
+    fn documentation(&self, handle: &Handle, position: TextSize) -> Vec<String> {
+        let options = HoverOptions {
+            show_go_to_links: false,
+            verbosity_level: 0,
+            field_docstring_at_definition: true,
+        };
+        match get_hover_with_verbosity(self.transaction, handle, position, options) {
+            Some(HoverResult {
+                hover:
+                    Hover {
+                        contents: Contents::MarkupContent(markup),
+                        ..
+                    },
+                ..
+            }) => vec![markup.value],
+            _ => Vec::new(),
+        }
+    }
+
+    /// The symbol a use refers to, and whether it is defined outside the project, or `None` if
+    /// it has no definition we can name.
+    fn reference(&mut self, handle: &Handle, module: &Module, x: &Use) -> Option<(String, bool)> {
         let preference = preference();
         let definition = match x.kind {
             UseKind::Name => self
@@ -317,12 +401,9 @@ impl Indexer<'_> {
                 .find_definition_for_name_use(handle, &x.identifier, preference)
                 .ok()?,
             UseKind::Import | UseKind::Attribute | UseKind::Keyword => {
-                // At the identifier's last character, a dotted module name in an import resolves
-                // to the whole module rather than to its first component.
-                let position = x.identifier.range.end() - TextSize::from(1);
                 let definitions = self
                     .transaction
-                    .find_definition(handle, position, preference)
+                    .find_definition(handle, use_position(x), preference)
                     .ok()?;
                 definitions.into_iter().next()
             }
@@ -330,26 +411,33 @@ impl Indexer<'_> {
         self.symbol(handle, module, definition)
     }
 
-    /// The symbol of a definition, or `None` if it is a local of another module or has no
-    /// definition we can name.
+    /// The symbol of a definition, and whether it is defined outside the project, or `None` if
+    /// it is a local of another module or has no definition we can name.
     fn symbol(
         &mut self,
         handle: &Handle,
         module: &Module,
         definition: FindDefinitionItemWithDocstring,
-    ) -> Option<String> {
+    ) -> Option<(String, bool)> {
+        let external = !definition
+            .module
+            .path()
+            .as_path()
+            .starts_with(self.project_root);
         let package = self.package(&definition.module, handle.sys_info().dupe());
         // A submodule accessed as an attribute resolves to the empty range at the module's start.
         if definition.metadata.symbol_kind() == Some(SymbolKind::Module)
             || definition.definition_range.is_empty()
         {
-            return Some(module_symbol(&package, definition.module.name()));
+            return Some((module_symbol(&package, definition.module.name()), external));
         }
         let symbols = self.definitions(&definition.module, handle.sys_info().dupe())?;
         match symbols.get(&definition.definition_range)? {
-            ScipSymbol::Global(descriptors) => Some(global_symbol(&package, descriptors.clone())),
+            ScipSymbol::Global(descriptors) => {
+                Some((global_symbol(&package, descriptors.clone()), external))
+            }
             ScipSymbol::Local(id) => {
-                (definition.module.path() == module.path()).then(|| format!("local {id}"))
+                (definition.module.path() == module.path()).then(|| (format!("local {id}"), false))
             }
         }
     }
@@ -498,6 +586,12 @@ fn collect_expr_uses(x: &Expr, uses: &mut Vec<Use>) {
     x.recurse(&mut |x| collect_expr_uses(x, uses));
 }
 
+/// The position at which a use is resolved. At the identifier's last character, a dotted module
+/// name in an import resolves to the whole module rather than to its first component.
+fn use_position(x: &Use) -> TextSize {
+    x.identifier.range.end() - TextSize::from(1)
+}
+
 fn preference() -> FindPreference {
     FindPreference {
         // A call like `C()` refers to the class `C`, not to `C.__init__`.
@@ -607,6 +701,8 @@ fn module_symbol(package: &Package, module: ModuleName) -> String {
 
 #[cfg(test)]
 mod tests {
+    use protobuf::Message as _;
+
     use super::*;
     use crate::report::scip::snapshot::format_snapshot;
     use crate::state::require::Require;
@@ -634,11 +730,9 @@ mod tests {
         Package::project(&input_dir, field("name"), field("version")).unwrap()
     }
 
-    fn assert_snapshot(case: &str) {
+    fn index(case: &str) -> Index {
         let snapshots = snapshots_dir();
         let input_dir = snapshots.join("input").join(case);
-        let output_dir = snapshots.join("output").join(case);
-
         let mut env = TestEnv::new();
         let mut handles = Vec::new();
         for path in glob::glob(&format!("{}/**/*.py", input_dir.display())).unwrap() {
@@ -660,14 +754,20 @@ mod tests {
             .with_site_package_paths(vec![snapshots.join("site-packages")])
             .with_default_require_level(Require::Everything)
             .to_state();
-        let index = scip(
+        scip(
             &state.transaction(),
             &handles,
             &input_dir,
             &project_package(&snapshots, case),
             "test",
-        );
+        )
+    }
 
+    fn assert_snapshot(case: &str) {
+        let snapshots = snapshots_dir();
+        let input_dir = snapshots.join("input").join(case);
+        let output_dir = snapshots.join("output").join(case);
+        let index = index(case);
         let update = std::env::var("SCIP_UPDATE_SNAPSHOTS").is_ok();
         for doc in &index.documents {
             let input = fs_anyhow::read_to_string(&input_dir.join(&doc.relative_path)).unwrap();
@@ -691,6 +791,25 @@ mod tests {
                 output_path.display()
             );
         }
+    }
+
+    #[test]
+    fn external_symbols_are_deduplicated() {
+        // `print` and `int` are each referenced more than once.
+        let bytes = index("class_nohint").write_to_bytes().unwrap();
+        let symbols: Vec<String> = Index::parse_from_bytes(&bytes)
+            .unwrap()
+            .external_symbols
+            .into_iter()
+            .map(|x| x.symbol)
+            .collect();
+        assert_eq!(
+            symbols,
+            [
+                "scip-python python python-stdlib 3.13 builtins/int#",
+                "scip-python python python-stdlib 3.13 builtins/print().",
+            ]
+        );
     }
 
     macro_rules! snapshot_tests {
