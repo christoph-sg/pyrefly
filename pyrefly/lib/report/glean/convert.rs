@@ -41,15 +41,19 @@ use ruff_python_ast::name::Name;
 use ruff_text_size::Ranged;
 use ruff_text_size::TextRange;
 use ruff_text_size::TextSize;
-use starlark_map::small_set::SmallSet;
 use thin_vec::ThinVec;
 use vec1::Vec1;
 
+use crate::binding::symbols::DefinitionKind;
+use crate::binding::symbols::ScopeId;
+use crate::binding::symbols::SymbolInventory;
+use crate::binding::symbols::SymbolScopeKind;
 use crate::module::module_info::ModuleInfo;
 use crate::report::glean::facts::*;
 use crate::report::glean::schema::*;
 use crate::state::lsp::FindDefinitionItemWithDocstring;
 use crate::state::lsp::FindPreference;
+use crate::state::lsp::ImportBehavior;
 use crate::state::state::Transaction;
 use crate::types::types::Type;
 
@@ -76,32 +80,48 @@ pub(crate) fn join_names(base_name: &str, name: &str) -> String {
     }
 }
 
-/// Compute the scope prefix for a Glean qualified name.
-///
-/// This is the single source of truth for how Glean scopes are determined
-/// from the container hierarchy. The full qualified name is
-/// `join_names(&scope, declaration_name)`.
-pub(crate) fn compute_scope(
-    container_fq_name: &str,
-    is_function_container: bool,
-    scope_type: &ScopeType,
-    module_name: &str,
-) -> String {
-    match scope_type {
-        ScopeType::Global => module_name.to_owned(),
-        ScopeType::Nonlocal => {
-            let mut parts: Vec<&str> = container_fq_name.split('.').collect();
-            parts.pop();
-            parts.join(".")
-        }
-        ScopeType::Local => {
-            if is_function_container {
-                container_fq_name.to_owned() + ".<locals>"
-            } else {
-                container_fq_name.to_owned()
-            }
-        }
+/// Format a named container's local prefix. Ownership is determined by the binder,
+/// not by this naming convention. Also used by external-provider name formatting.
+pub(crate) fn compute_scope(container_fq_name: &str, is_function_container: bool) -> String {
+    if is_function_container {
+        container_fq_name.to_owned() + ".<locals>"
+    } else {
+        container_fq_name.to_owned()
     }
+}
+
+/// Glean owns the spelling of names; the inventory supplies declaration ownership.
+/// Anonymous scopes use source offsets, never analysis-local IDs, to avoid collisions.
+fn scope_name(inventory: &SymbolInventory, id: ScopeId, module: &str) -> Option<String> {
+    let scope = inventory.scope(id);
+    if scope.kind == SymbolScopeKind::Module {
+        return Some(module.to_owned());
+    }
+    if let Some(declaration) = &scope.declaration {
+        let site = inventory.definition_at(declaration.range)?;
+        let symbol = inventory.symbol(*site.symbol.as_ref().ok()?);
+        let name = join_names(&scope_name(inventory, symbol.owner, module)?, &symbol.name);
+        return Some(compute_scope(
+            &name,
+            scope.kind == SymbolScopeKind::Function,
+        ));
+    }
+    let prefix = scope_name(
+        inventory,
+        scope.parent.expect("non-module scope has a parent"),
+        module,
+    )?;
+    let kind = match scope.kind {
+        SymbolScopeKind::Lambda => "lambda",
+        SymbolScopeKind::Comprehension => "comprehension",
+        SymbolScopeKind::Annotation => "type-parameters",
+        SymbolScopeKind::TypeAlias => "type-alias",
+        _ => unreachable!("named scopes have a declaration"),
+    };
+    Some(join_names(
+        &prefix,
+        &format!("<{kind}@{}>", scope.range.start().to_u32()),
+    ))
 }
 
 fn find_preference_glean() -> FindPreference {
@@ -165,26 +185,6 @@ fn file_fact(module_info: &ModuleInfo) -> src::File {
     src::File::new(relative_path.replace('\\', "/"))
 }
 
-pub(crate) fn gather_nonlocal_variables(
-    body: &[Stmt],
-) -> (Arc<SmallSet<Name>>, Arc<SmallSet<Name>>) {
-    let mut globals = SmallSet::new();
-    let mut nonlocals = SmallSet::new();
-    for stmt in body {
-        match stmt {
-            Stmt::Global(stmt_global) => {
-                globals.extend(stmt_global.names.iter().map(|name| name.id.clone()))
-            }
-            Stmt::Nonlocal(stmt_nonlocal) => {
-                nonlocals.extend(stmt_nonlocal.names.iter().map(|name| name.id.clone()))
-            }
-            _ => {}
-        }
-    }
-
-    (Arc::new(globals), Arc::new(nonlocals))
-}
-
 fn create_sname(name: &str) -> python::SName {
     let parts = name.split(".");
     let mut parent = None;
@@ -196,11 +196,6 @@ fn create_sname(name: &str) -> python::SName {
     }
 
     parent.unwrap()
-}
-pub(crate) enum ScopeType {
-    Global,
-    Nonlocal,
-    Local,
 }
 struct DeclarationInfo {
     declaration: python::Declaration,
@@ -232,13 +227,13 @@ struct Facts {
 struct NodeContext {
     container: Arc<python::DeclarationContainer>,
     top_level_decl: Arc<python::Declaration>,
-    globals: Arc<SmallSet<Name>>,
-    nonlocals: Arc<SmallSet<Name>>,
 }
 
 struct GleanState<'a> {
     transaction: &'a Transaction<'a>,
     handle: &'a Handle,
+    inventory: &'a SymbolInventory,
+    emitted_definitions: HashSet<TextRange>,
     module: ModuleInfo,
     module_name: ModuleName,
     facts: Facts,
@@ -283,11 +278,17 @@ impl Facts {
 }
 
 impl GleanState<'_> {
-    fn new<'a>(transaction: &'a Transaction<'a>, handle: &'a Handle) -> GleanState<'a> {
+    fn new<'a>(
+        transaction: &'a Transaction<'a>,
+        handle: &'a Handle,
+        inventory: &'a SymbolInventory,
+    ) -> GleanState<'a> {
         let module_info = &transaction.get_module_info(handle).unwrap();
         GleanState {
             transaction,
             handle,
+            inventory,
+            emitted_definitions: HashSet::new(),
             module: module_info.clone(),
             module_name: module_info.name(),
             facts: Facts::new(
@@ -497,27 +498,10 @@ impl GleanState<'_> {
         );
     }
 
-    fn make_fq_name_for_declaration(
-        &mut self,
-        name: &Identifier,
-        container: &python::DeclarationContainer,
-        scope_type: ScopeType,
-    ) -> python::Name {
-        let (container_fq_name, is_function_container) = match container {
-            python::DeclarationContainer::module(module) => (module.key.name.key.as_str(), false),
-            python::DeclarationContainer::cls(cls) => (cls.key.name.key.as_str(), false),
-            python::DeclarationContainer::func(func) => (func.key.name.key.as_str(), true),
-        };
-        let scope = compute_scope(
-            container_fq_name,
-            is_function_container,
-            &scope_type,
-            &self.module_name.to_string(),
-        );
-        if !self.names.contains(&scope) {
-            self.record_name(scope.clone());
-        }
-        self.record_name_with_position(join_names(&scope, name), name.range.start())
+    fn make_fq_name_for_declaration(&mut self, range: TextRange) -> Option<python::Name> {
+        let name = self.locations_fqnames.get(&range.start())?;
+        self.emitted_definitions.insert(range);
+        Some(python::Name::new((**name).clone()))
     }
 
     fn get_definition_location(
@@ -533,16 +517,16 @@ impl GleanState<'_> {
         let module_name = module.name();
 
         if module_name == self.module_name {
-            let fqname_type =
-                type_name.and_then(|qname| self.locations_fqnames.get(&qname.range().start()));
-
-            let fqname = if let Some(ty) = fqname_type {
-                Some(join_names(ty, local_name))
-            } else {
-                self.locations_fqnames
-                    .get(&def_range.start())
-                    .map(|name| (**name).clone())
-            };
+            // The resolved declaration owns an inherited field, not the receiver's class.
+            let fqname = self
+                .locations_fqnames
+                .get(&def_range.start())
+                .map(|name| (**name).clone())
+                .or_else(|| {
+                    type_name
+                        .and_then(|qname| self.locations_fqnames.get(&qname.range().start()))
+                        .map(|ty| join_names(ty, local_name))
+                });
 
             if let Some(name) = fqname {
                 vec![DefinitionLocation { name, file }]
@@ -555,7 +539,24 @@ impl GleanState<'_> {
             if module_name == ModuleName::builtins() {
                 vec![DefinitionLocation { name: fqname, file }]
             } else {
-                let name = join_names(module_name.as_str(), &fqname);
+                let handle = Handle::new(
+                    module_name,
+                    module.path().dupe(),
+                    self.handle.sys_info().dupe(),
+                );
+                let name = self
+                    .transaction
+                    .get_answers(&handle)
+                    .and_then(|answers| {
+                        let inventory = answers.bindings().symbol_inventory()?;
+                        let site = inventory.definition_at(def_range)?;
+                        let symbol = inventory.symbol(*site.symbol.as_ref().ok()?);
+                        Some(join_names(
+                            &scope_name(inventory, symbol.owner, module_name.as_str())?,
+                            &symbol.name,
+                        ))
+                    })
+                    .unwrap_or_else(|| join_names(module_name.as_str(), &fqname));
                 let mut definitions = vec![DefinitionLocation {
                     name: name.clone(),
                     file,
@@ -601,7 +602,25 @@ impl GleanState<'_> {
         range: TextRange,
         only_resolved_name: bool,
     ) -> Vec<DefinitionLocation> {
-        let as_name = join_names(self.module_name.as_str(), self.module.code_at(range));
+        // Resolve the local import site through the existing resolver rather than guessing
+        // its owner from the use's containing scope (which is wrong for captures).
+        let definition = self
+            .transaction
+            .find_definition_for_name_use(
+                self.handle,
+                &Identifier::new(Name::new(self.module.code_at(range)), range),
+                FindPreference {
+                    import_behavior: ImportBehavior::StopAtEverything,
+                    ..find_preference_glean()
+                },
+            )
+            .unwrap_or(None);
+        let as_name = definition
+            .as_ref()
+            .filter(|def| def.module.name() == self.module_name)
+            .and_then(|def| self.locations_fqnames.get(&def.definition_range.start()))
+            .map(|name| (**name).clone())
+            .unwrap_or_else(|| join_names(self.module_name.as_str(), self.module.code_at(range)));
 
         let mut definitions = vec![];
         if let Some((resolved_name, from_name, resolved_file, from_file)) =
@@ -1067,15 +1086,15 @@ impl GleanState<'_> {
     ) -> python::Parameter {
         let type_info: Option<python::TypeInfo> =
             self.visit_annotation_exprs(param.annotation(), container);
-        let fqname =
-            self.make_fq_name_for_declaration(&param.name, &context.container, ScopeType::Local);
-        decl_infos.push(self.variable_info(
-            fqname,
-            param.name.range(),
-            type_info.clone(),
-            None,
-            context,
-        ));
+        if let Some(fqname) = self.make_fq_name_for_declaration(param.name.range()) {
+            decl_infos.push(self.variable_info(
+                fqname,
+                param.name.range(),
+                type_info.clone(),
+                None,
+                context,
+            ));
+        }
         python::Parameter {
             name: python::Name::new(param.name().to_string()),
             typeInfo: type_info,
@@ -1178,17 +1197,8 @@ impl GleanState<'_> {
     ) {
         if let Some(name) = expr.as_name_expr()
             && name.ctx.is_store()
+            && let Some(fqname) = self.make_fq_name_for_declaration(name.range)
         {
-            let scope_type = if ctx.globals.contains(&name.id) {
-                ScopeType::Global
-            } else if ctx.nonlocals.contains(&name.id) {
-                ScopeType::Nonlocal
-            } else {
-                ScopeType::Local
-            };
-
-            let name_id = Ast::expr_name_identifier(name.clone());
-            let fqname = self.make_fq_name_for_declaration(&name_id, &ctx.container, scope_type);
             let docstring_range =
                 next.and_then(|stmt| Docstring::range_from_stmts(slice::from_ref(stmt)));
             def_infos.push(self.variable_info(
@@ -1247,11 +1257,16 @@ impl GleanState<'_> {
         &mut self,
         from_name: &Identifier,
         as_name: &Identifier,
+        binding_range: TextRange,
         resolved: DefinitionLocation,
         from_file: Option<src::File>,
         top_level_declaration: &python::Declaration,
-    ) -> DeclarationInfo {
-        let as_name_fqname = join_names(self.module_name.as_str(), as_name);
+    ) -> Option<DeclarationInfo> {
+        let site = self.inventory.definition_at(binding_range)?;
+        let symbol = self.inventory.symbol(*site.symbol.as_ref().ok()?);
+        let scope = scope_name(self.inventory, symbol.owner, self.module_name.as_str())?;
+        // Dotted imports also emit facts for their prefixes; all use the binding's owner.
+        let as_name_fqname = join_names(&scope, as_name);
         let from_name_fact = python::Name::new(from_name.id().to_string());
         let as_name_fact = python::Name::new(as_name_fqname.clone());
 
@@ -1262,14 +1277,14 @@ impl GleanState<'_> {
         self.record_name_for_import(as_name_fqname, resolved, from);
         let import_fact = python::ImportStatement::new(from_name_fact, as_name_fact);
 
-        DeclarationInfo {
+        Some(DeclarationInfo {
             declaration: python::Declaration::imp(import_fact),
             decl_span: to_span(from_name.range),
             definition: None,
             def_span: None,
             top_level_decl: top_level_declaration.clone(),
             docstring_range: None,
-        }
+        })
     }
 
     fn add_xrefs_for_module(&mut self, module_name: ModuleName, position: TextSize, prefix: &str) {
@@ -1299,16 +1314,19 @@ impl GleanState<'_> {
 
                 if let Some(as_name) = &import.asname {
                     let def = self.find_definition_for_imported_module(module_name);
-                    vec![self.make_import_fact(
+                    self.make_import_fact(
                         from_name,
                         as_name,
+                        as_name.range,
                         def,
                         None,
                         top_level_declaration,
-                    )]
+                    )
+                    .into_iter()
+                    .collect::<Vec<_>>()
                 } else {
                     all_modules_with_range(module_name, position)
-                        .map(|(module, range)| {
+                        .filter_map(|(module, range)| {
                             let mod_range = TextRange::new(position, range.end());
                             let mod_id = Identifier::new(Name::new(module.clone()), mod_range);
                             let def = self
@@ -1316,6 +1334,7 @@ impl GleanState<'_> {
                             self.make_import_fact(
                                 &mod_id,
                                 &mod_id,
+                                from_name.range,
                                 def,
                                 None,
                                 top_level_declaration,
@@ -1420,9 +1439,10 @@ impl GleanState<'_> {
                     .unwrap_or(from_name_definition.clone());
 
                 let from_name_id = Identifier::new(Name::new(from_name_string), from_name.range);
-                decl_infos.push(self.make_import_fact(
+                decl_infos.extend(self.make_import_fact(
                     &from_name_id,
                     as_name,
+                    as_name.range,
                     definition.clone(),
                     from_module_file.clone(),
                     top_level_declaration,
@@ -1517,13 +1537,29 @@ impl GleanState<'_> {
 
     fn generate_facts(&mut self, ast: &ThinVec<Stmt>, range: TextRange) {
         self.module_facts(range);
+        // Register all definition names before collecting references, including definitions
+        // that appear later in the file or only inside expressions.
+        for site in self.inventory.definitions() {
+            if site.kind == DefinitionKind::Import && self.module.code_at(site.range) == "*" {
+                continue;
+            }
+            let Ok(id) = site.symbol else { continue };
+            let symbol = self.inventory.symbol(id);
+            if let Some(scope) = scope_name(self.inventory, symbol.owner, self.module_name.as_str())
+            {
+                self.record_name(scope.clone());
+                self.record_name_with_position(
+                    join_names(&scope, &symbol.name),
+                    site.range.start(),
+                );
+            }
+        }
         let mut nodes = VecDeque::new();
+        let mut contexts = HashMap::new();
 
         let root_context = NodeContext {
             container: Arc::new(python::DeclarationContainer::module(self.module_fact())),
             top_level_decl: Arc::new(python::Declaration::module(self.module_fact())),
-            globals: Arc::new(SmallSet::new()),
-            nonlocals: Arc::new(SmallSet::new()),
         };
         ast.visit(&mut |x| nodes.push_back((x, root_context.clone())));
 
@@ -1534,7 +1570,48 @@ impl GleanState<'_> {
                 .filter(|(_, ctx)| ctx.container == node_context.container)
                 .map(|(x, _)| *x);
             let children_context = self.process_statement(node, next, &node_context);
+            match node {
+                Stmt::ClassDef(class) => {
+                    contexts.insert(class.name.range, children_context.clone());
+                }
+                Stmt::FunctionDef(function) => {
+                    contexts.insert(function.name.range, children_context.clone());
+                }
+                _ => {}
+            }
             node.recurse(&mut |x| nodes.push_back((x, children_context.clone())));
+        }
+
+        // The statement traversal supplies rich spans, annotations and docstrings. The
+        // inventory also contains expression bindings, pattern names and receiver fields.
+        // Glean only has named containers, so anonymous scopes use their nearest named
+        // container here; their qualified names still distinguish the lexical scopes.
+        for site in self.inventory.definitions() {
+            if matches!(
+                site.kind,
+                DefinitionKind::Import | DefinitionKind::Function | DefinitionKind::Class
+            ) || self.emitted_definitions.contains(&site.range)
+            {
+                continue;
+            }
+            let Ok(id) = site.symbol else { continue };
+            let Some(name) = self.make_fq_name_for_declaration(site.range) else {
+                continue;
+            };
+            let mut owner = self.inventory.symbol(id).owner;
+            let context = loop {
+                let scope = self.inventory.scope(owner);
+                if let Some(declaration) = &scope.declaration {
+                    break contexts
+                        .get(&declaration.range)
+                        .expect("named scopes were visited");
+                }
+                match scope.parent {
+                    Some(parent) => owner = parent,
+                    None => break &root_context,
+                }
+            };
+            self.declaration_facts(self.variable_info(name, site.range, None, None, context));
         }
     }
 
@@ -1552,8 +1629,9 @@ impl GleanState<'_> {
         let mut decl_infos = vec![];
         match stmt {
             Stmt::ClassDef(cls) => {
-                let cls_fq_name =
-                    self.make_fq_name_for_declaration(&cls.name, container, ScopeType::Local);
+                let Some(cls_fq_name) = self.make_fq_name_for_declaration(cls.name.range) else {
+                    return this_ctx;
+                };
                 let cls_declaration = python::ClassDeclaration::new(cls_fq_name, None);
                 let decl_info = self.class_facts(cls, cls_declaration.clone(), context);
                 self.visit_exprs(&cls.decorator_list, container);
@@ -1563,13 +1641,13 @@ impl GleanState<'_> {
                     this_ctx.top_level_decl = Arc::new(decl_info.declaration.clone());
                 }
                 this_ctx.container = Arc::new(python::DeclarationContainer::cls(cls_declaration));
-                (this_ctx.globals, this_ctx.nonlocals) = gather_nonlocal_variables(&cls.body);
 
                 decl_infos.push(decl_info);
             }
             Stmt::FunctionDef(func) => {
-                let func_fq_name =
-                    self.make_fq_name_for_declaration(&func.name, container, ScopeType::Local);
+                let Some(func_fq_name) = self.make_fq_name_for_declaration(func.name.range) else {
+                    return this_ctx;
+                };
                 let func_declaration = python::FunctionDeclaration::new(func_fq_name);
                 if let python::Declaration::module(_) = top_level_decl {
                     this_ctx.top_level_decl =
@@ -1577,7 +1655,6 @@ impl GleanState<'_> {
                 }
                 this_ctx.container =
                     Arc::new(python::DeclarationContainer::func(func_declaration.clone()));
-                (this_ctx.globals, this_ctx.nonlocals) = gather_nonlocal_variables(&func.body);
                 let mut func_decl_infos =
                     self.function_facts(func, func_declaration, context, &this_ctx);
 
@@ -1670,12 +1747,9 @@ impl GleanState<'_> {
                 stmt_try.handlers.iter().for_each(|x| match x {
                     ExceptHandler::ExceptHandler(x) => {
                         self.visit_exprs(&x.type_, container);
-                        if let Some(name) = &x.name {
-                            let fq_name = self.make_fq_name_for_declaration(
-                                name,
-                                container,
-                                ScopeType::Local,
-                            );
+                        if let Some(name) = &x.name
+                            && let Some(fq_name) = self.make_fq_name_for_declaration(name.range)
+                        {
                             decl_infos.push(self.variable_info(
                                 fq_name,
                                 name.range(),
@@ -1699,7 +1773,14 @@ impl GleanState<'_> {
 
 pub fn glean(transaction: &Transaction, handle: &Handle, ownership: bool) -> Glean {
     let ast = &*transaction.get_ast(handle).unwrap();
-    let mut glean_state = GleanState::new(transaction, handle);
+    let answers = transaction
+        .get_answers(handle)
+        .expect("Glean requires retained answers");
+    let inventory = answers
+        .bindings()
+        .symbol_inventory()
+        .expect("Glean requires a symbol inventory");
+    let mut glean_state = GleanState::new(transaction, handle, inventory);
 
     glean_state.record_name("".to_owned());
     let file_language_fact = src::FileLanguage::new(glean_state.file_fact(), src::Language::Python);
@@ -1767,41 +1848,16 @@ mod tests {
 
     #[test]
     fn test_compute_scope_module() {
-        assert_eq!(
-            compute_scope("mymod", false, &ScopeType::Local, "mymod"),
-            "mymod"
-        );
+        assert_eq!(compute_scope("mymod", false), "mymod");
     }
 
     #[test]
     fn test_compute_scope_class() {
-        assert_eq!(
-            compute_scope("mymod.Foo", false, &ScopeType::Local, "mymod"),
-            "mymod.Foo"
-        );
+        assert_eq!(compute_scope("mymod.Foo", false), "mymod.Foo");
     }
 
     #[test]
     fn test_compute_scope_function() {
-        assert_eq!(
-            compute_scope("mymod.foo", true, &ScopeType::Local, "mymod"),
-            "mymod.foo.<locals>"
-        );
-    }
-
-    #[test]
-    fn test_compute_scope_global() {
-        assert_eq!(
-            compute_scope("mymod.foo", true, &ScopeType::Global, "mymod"),
-            "mymod"
-        );
-    }
-
-    #[test]
-    fn test_compute_scope_nonlocal() {
-        assert_eq!(
-            compute_scope("mymod.foo.bar", true, &ScopeType::Nonlocal, "mymod"),
-            "mymod.foo"
-        );
+        assert_eq!(compute_scope("mymod.foo", true), "mymod.foo.<locals>");
     }
 }

@@ -81,6 +81,7 @@ use crate::binding::scope::ClassIndices;
 use crate::binding::scope::FlowStyle;
 use crate::binding::scope::Scope;
 use crate::binding::shape_type::ShapeDeclarationOwner;
+use crate::binding::symbols::DefinitionKind;
 use crate::config::error_kind::ErrorKind;
 use crate::export::special::SpecialExport;
 use crate::types::class::ClassDefIndex;
@@ -530,6 +531,10 @@ impl<'a> BindingsBuilder<'a> {
                 pristine: true,
             },
         );
+        // Functional class factories also produce Binding::ClassDef, but their source
+        // occurrence is an assignment rather than a class declaration.
+        self.scopes
+            .record_definition(&x.name.id, x.name.range, DefinitionKind::Class);
 
         // Insert a `KeyTParams` / `BindingTParams` pair, but only if there is at least
         // one generic base class - otherwise, it is not possible that legacy tparams are used.

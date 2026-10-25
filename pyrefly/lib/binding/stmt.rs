@@ -69,6 +69,7 @@ use crate::binding::scope::FlowStyle;
 use crate::binding::scope::LoopExit;
 use crate::binding::scope::Scope;
 use crate::binding::scope::TerminationKind;
+use crate::binding::symbols::DefinitionKind;
 use crate::config::error_kind::ErrorKind;
 use crate::export::definitions::MutableCaptureKind;
 use crate::export::special::SpecialExport;
@@ -365,6 +366,8 @@ impl<'a> BindingsBuilder<'a> {
                 let asname = x.asname.as_ref().unwrap_or(&x.name);
                 // We pass None as imported_from, since we are really faking up a local error definition
                 self.bind_definition(asname, Binding::Any(style), FlowStyle::Other);
+                self.scopes
+                    .record_definition(&asname.id, asname.range, DefinitionKind::Import);
             }
         }
     }
@@ -1228,6 +1231,11 @@ impl<'a> BindingsBuilder<'a> {
                         let ann = self.bind_current(&name.id, &assigned, FlowStyle::Other);
                         let binding = Binding::AugAssign(ann, Box::new(x.clone()));
                         self.insert_binding_current(assigned, binding);
+                        self.scopes.record_definition(
+                            &name.id,
+                            name.range,
+                            DefinitionKind::AugmentedAssignment,
+                        );
                     }
                     Expr::Attribute(attr) => {
                         let mut x_cloned = x.clone();

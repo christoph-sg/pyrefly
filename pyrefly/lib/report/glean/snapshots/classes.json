@@ -227,6 +227,33 @@
               "key": {
                 "name": {
                   "id": 0,
+                  "key": "classes.Animal.name"
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": 0,
+        "key": {
+          "container": {
+            "cls": {
+              "id": 0,
+              "key": {
+                "name": {
+                  "id": 0,
+                  "key": "classes.Animal"
+                }
+              }
+            }
+          },
+          "declaration": {
+            "variable": {
+              "id": 0,
+              "key": {
+                "name": {
+                  "id": 0,
                   "key": "classes.Animal.speak.<locals>.self"
                 }
               }
@@ -715,6 +742,30 @@
               "key": {
                 "name": {
                   "id": 0,
+                  "key": "classes.Animal.name"
+                }
+              }
+            }
+          },
+          "file": {
+            "id": 0,
+            "key": "classes.py"
+          },
+          "span": {
+            "length": 4,
+            "start": 122
+          }
+        }
+      },
+      {
+        "id": 0,
+        "key": {
+          "declaration": {
+            "variable": {
+              "id": 0,
+              "key": {
+                "name": {
+                  "id": 0,
                   "key": "classes.Animal.speak.<locals>.self"
                 }
               }
@@ -1172,6 +1223,46 @@
           "span": {
             "length": 330,
             "start": 0
+          }
+        }
+      },
+      {
+        "id": 0,
+        "key": {
+          "definition": {
+            "variable": {
+              "id": 0,
+              "key": {
+                "container": {
+                  "cls": {
+                    "id": 0,
+                    "key": {
+                      "name": {
+                        "id": 0,
+                        "key": "classes.Animal"
+                      }
+                    }
+                  }
+                },
+                "declaration": {
+                  "id": 0,
+                  "key": {
+                    "name": {
+                      "id": 0,
+                      "key": "classes.Animal.name"
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "file": {
+            "id": 0,
+            "key": "classes.py"
+          },
+          "span": {
+            "length": 4,
+            "start": 122
           }
         }
       },
@@ -1699,6 +1790,10 @@
             {
               "length": 4,
               "start": 186
+            },
+            {
+              "length": 4,
+              "start": 278
             }
           ],
           "target": {
@@ -1723,25 +1818,6 @@
           "target": {
             "id": 0,
             "key": "classes.Dog.speak.<locals>.self"
-          }
-        }
-      },
-      {
-        "id": 0,
-        "key": {
-          "file": {
-            "id": 0,
-            "key": "classes.py"
-          },
-          "spans": [
-            {
-              "length": 4,
-              "start": 278
-            }
-          ],
-          "target": {
-            "id": 0,
-            "key": "classes.Dog.name"
           }
         }
       },
@@ -2110,7 +2186,7 @@
                 },
                 "name": {
                   "id": 0,
-                  "key": "classes.Dog.name"
+                  "key": "classes.Animal.name"
                 }
               }
             },
@@ -2423,7 +2499,7 @@
               },
               "target": {
                 "id": 0,
-                "key": "classes.Dog.name"
+                "key": "classes.Animal.name"
               }
             },
             {
@@ -2774,6 +2850,40 @@
                           }
                         }
                       }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      {
+        "id": 0,
+        "key": {
+          "id": 0,
+          "key": "classes.Animal.name"
+        },
+        "value": {
+          "id": 0,
+          "key": {
+            "local_name": {
+              "id": 0,
+              "key": "name"
+            },
+            "parent": {
+              "id": 0,
+              "key": {
+                "local_name": {
+                  "id": 0,
+                  "key": "Animal"
+                },
+                "parent": {
+                  "id": 0,
+                  "key": {
+                    "local_name": {
+                      "id": 0,
+                      "key": "classes"
                     }
                   }
                 }

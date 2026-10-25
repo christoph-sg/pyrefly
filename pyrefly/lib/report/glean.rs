@@ -315,3 +315,215 @@ fn ownership_test() {
         }
     }
 }
+
+#[cfg(test)]
+mod symbol_tests {
+    use serde_json::Value;
+
+    use super::glean;
+    use crate::state::require::Require;
+    use crate::test::util::mk_multi_file_state;
+
+    fn index(code: &str) -> Value {
+        let (handles, state) = mk_multi_file_state(&[("m", code)], Require::Everything, false);
+        serde_json::from_str(&glean(&state.transaction(), &handles["m"], false)).unwrap()
+    }
+
+    fn facts<'a>(index: &'a Value, predicate: &str) -> &'a [Value] {
+        index
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["predicate"] == predicate)
+            .unwrap()["facts"]
+            .as_array()
+            .unwrap()
+    }
+
+    fn variables(index: &Value) -> Vec<(&str, u64)> {
+        facts(index, "python.DeclarationLocation.4")
+            .iter()
+            .filter_map(|fact| {
+                Some((
+                    fact["key"]["declaration"]["variable"]["key"]["name"]["key"].as_str()?,
+                    fact["key"]["span"]["start"].as_u64().unwrap(),
+                ))
+            })
+            .collect()
+    }
+
+    fn xrefs(index: &Value) -> Vec<(&str, u64)> {
+        facts(index, "python.XRefsViaNameByTarget.4")
+            .iter()
+            .flat_map(|fact| {
+                let target = fact["key"]["target"]["key"].as_str().unwrap();
+                fact["key"]["spans"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(move |span| (target, span["start"].as_u64().unwrap()))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn captures_use_the_binding_owner() {
+        let code = r#"
+shared = 0
+def outer():
+    value = 1
+    def middle():
+        def writer(flag):
+            if flag:
+                global shared
+                nonlocal value
+            shared = 2
+            value = 3
+            return value, shared
+    return later()
+def invalid():
+    nonlocal absent
+    absent = 4
+def later():
+    return 5
+"#;
+        let result = index(code);
+        let vars = variables(&result);
+        for (source, expected) in [
+            ("shared = 0", "m.shared"),
+            ("shared = 2", "m.shared"),
+            ("value = 1", "m.outer.<locals>.value"),
+            ("value = 3", "m.outer.<locals>.value"),
+        ] {
+            assert!(
+                vars.contains(&(expected, code.find(source).unwrap() as u64)),
+                "{source}: {vars:?}"
+            );
+        }
+        assert!(!vars.iter().any(|(name, _)| name.ends_with(".absent")));
+        let refs = xrefs(&result);
+        for (source, expected) in [
+            ("value, shared", "m.outer.<locals>.value"),
+            ("shared\n", "m.shared"),
+            ("later()\ndef invalid", "m.later"),
+        ] {
+            assert!(
+                refs.contains(&(expected, code.rfind(source).unwrap() as u64)),
+                "{refs:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn anonymous_scopes_and_receiver_fields_have_definitions() {
+        let code = r#"
+x = 0
+values = [(saved := x) for x in range(3)]
+callback = lambda x: (local := x)
+class Base:
+    inherited = 1
+class Child(Base):
+    def method(self, value):
+        self.owned = value
+        return self.inherited
+"#;
+        let result = index(code);
+        let vars = variables(&result);
+        let comp = code.find("[(saved").unwrap();
+        let lambda = code.find("lambda x").unwrap();
+        for (name, position) in [
+            ("m.saved".to_owned(), code.find("saved :=").unwrap()),
+            (
+                format!("m.<comprehension@{comp}>.x"),
+                code.find("x in range").unwrap(),
+            ),
+            (format!("m.<lambda@{lambda}>.x"), lambda + "lambda ".len()),
+            (
+                format!("m.<lambda@{lambda}>.local"),
+                code.find("local :=").unwrap(),
+            ),
+            ("m.Child.owned".to_owned(), code.find("owned =").unwrap()),
+        ] {
+            assert!(
+                vars.contains(&(name.as_str(), position as u64)),
+                "{name}: {vars:?}"
+            );
+        }
+        assert!(!vars.iter().any(|(name, _)| *name == "m.Child.inherited"));
+        let refs = xrefs(&result);
+        for (name, position) in [
+            (
+                format!("m.<comprehension@{comp}>.x"),
+                code.find("x) for").unwrap(),
+            ),
+            (
+                "m.Base.inherited".to_owned(),
+                code.find("inherited\n").unwrap(),
+            ),
+        ] {
+            assert!(refs.contains(&(name.as_str(), position as u64)), "{refs:?}");
+        }
+        assert!(!refs.iter().any(|(name, _)| *name == "m.Child.inherited"));
+        // Lambda parameter definitions are indexed, but their reads still depend on
+        // the existing definition resolver, which does not resolve them yet.
+    }
+
+    #[test]
+    fn local_imports_and_cross_module_fields() {
+        let code = r#"
+def first():
+    from dependency import Base as alias
+    return alias()
+def second():
+    from dependency import Other as alias
+    import dependency.nested
+    return alias(), dependency.nested
+from dependency import Child
+value = Child().field
+"#;
+        let (handles, state) = mk_multi_file_state(
+            &[
+                ("m", code),
+                (
+                    "dependency",
+                    "class Base:\n    field = 1\nclass Child(Base): pass\nclass Other: pass\n",
+                ),
+                ("dependency.nested", "value = 1\n"),
+            ],
+            Require::Everything,
+            false,
+        );
+        let result: Value =
+            serde_json::from_str(&glean(&state.transaction(), &handles["m"], false)).unwrap();
+        let mut imports: Vec<_> = facts(&result, "python.DeclarationLocation.4")
+            .iter()
+            .filter_map(|fact| fact["key"]["declaration"]["imp"]["key"]["as_name"]["key"].as_str())
+            .collect();
+        imports.sort_unstable();
+        assert_eq!(
+            imports,
+            [
+                "m.Child",
+                "m.first.<locals>.alias",
+                "m.second.<locals>.alias",
+                "m.second.<locals>.dependency",
+                "m.second.<locals>.dependency.nested"
+            ]
+        );
+        let refs = xrefs(&result);
+        for (target, position) in [
+            ("dependency.Base", code.find("alias()").unwrap()),
+            ("m.first.<locals>.alias", code.find("alias()").unwrap()),
+            ("dependency.Other", code.rfind("alias()").unwrap()),
+            ("m.second.<locals>.alias", code.rfind("alias()").unwrap()),
+            ("dependency.Base.field", code.find("field\n").unwrap()),
+        ] {
+            assert!(refs.contains(&(target, position as u64)), "{refs:?}");
+        }
+        assert!(
+            !refs
+                .iter()
+                .any(|(name, _)| *name == "dependency.Child.field")
+        );
+    }
+}
