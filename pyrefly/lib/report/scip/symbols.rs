@@ -7,30 +7,15 @@
 
 use std::collections::HashMap;
 
-use pyrefly_python::ast::Ast;
 use pyrefly_python::module_name::ModuleName;
-use ruff_python_ast::Comprehension;
-use ruff_python_ast::ExceptHandler;
-use ruff_python_ast::Expr;
-use ruff_python_ast::ExprAttribute;
-use ruff_python_ast::ExprContext;
-use ruff_python_ast::Identifier;
-use ruff_python_ast::ModModule;
-use ruff_python_ast::Parameters;
-use ruff_python_ast::Pattern;
-use ruff_python_ast::Stmt;
-use ruff_python_ast::name::Name;
-use ruff_python_ast::visitor::source_order::SourceOrderVisitor;
-use ruff_python_ast::visitor::source_order::walk_except_handler;
-use ruff_python_ast::visitor::source_order::walk_expr;
-use ruff_python_ast::visitor::source_order::walk_pattern;
-use ruff_python_ast::visitor::source_order::walk_stmt;
 use ruff_text_size::TextRange;
 use scip::types::Descriptor;
 use scip::types::descriptor::Suffix;
-use starlark_map::small_set::SmallSet;
 
-use crate::report::glean::convert::gather_nonlocal_variables;
+use crate::binding::symbols::DefinitionKind;
+use crate::binding::symbols::ScopeId;
+use crate::binding::symbols::SymbolInventory;
+use crate::binding::symbols::SymbolScopeKind;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum ScipSymbol {
@@ -38,18 +23,64 @@ pub enum ScipSymbol {
     Local(usize),
 }
 
-/// The SCIP symbol of every name a module defines, keyed by the defining identifier, in source
-/// order.
-pub fn definitions(module: ModuleName, ast: &ModModule) -> Vec<(TextRange, ScipSymbol)> {
+/// Assign SCIP descriptors to the binder's definition sites in source order. Lexical IDs
+/// only join occurrences within this analysis; persistent names contain source names only.
+pub fn definitions(
+    module: ModuleName,
+    inventory: &SymbolInventory,
+) -> Vec<(TextRange, ScipSymbol)> {
     let module_path = vec![descriptor(module.as_str(), Suffix::Namespace)];
-    let mut builder = Builder {
-        scopes: vec![Scope::new(ScopeKind::Module, module_path.clone())],
-        module_path,
-        definitions: Vec::new(),
-        next_local: 0,
-    };
-    builder.visit_body(&ast.body);
-    builder.definitions
+    let mut names: HashMap<_, ScipSymbol> = HashMap::new();
+    let mut next_local = 0;
+    let mut definitions = Vec::new();
+    for site in inventory.definitions() {
+        // Imports are emitted by reference collection. Preserve the existing policy that
+        // augmented assignments are references and type parameters have no SCIP definition.
+        if matches!(
+            site.kind,
+            DefinitionKind::Import
+                | DefinitionKind::AugmentedAssignment
+                | DefinitionKind::TypeParameter
+        ) {
+            continue;
+        }
+        let Ok(id) = site.symbol else { continue };
+        let binding = inventory.symbol(id);
+        let scope = inventory.scope(binding.owner);
+        let suffix = match site.kind {
+            DefinitionKind::Function => Some(Suffix::Method),
+            DefinitionKind::Class => Some(Suffix::Type),
+            DefinitionKind::Parameter if scope.kind == SymbolScopeKind::Function => {
+                Some(Suffix::Parameter)
+            }
+            _ => None,
+        };
+        let symbol = if let Some(suffix) = suffix {
+            // A declaration can reclassify an existing name. Later assignments retain that
+            // descriptor, while earlier occurrences keep the descriptor they already received.
+            let Some(path) = scope_path(inventory, binding.owner, &module_path) else {
+                continue;
+            };
+            ScipSymbol::Global(child(&path, &binding.name, suffix))
+        } else if let Some(symbol) = names.get(&id) {
+            symbol.clone()
+        } else if matches!(
+            scope.kind,
+            SymbolScopeKind::Module | SymbolScopeKind::Class(_)
+        ) {
+            let Some(path) = scope_path(inventory, binding.owner, &module_path) else {
+                continue;
+            };
+            ScipSymbol::Global(child(&path, &binding.name, Suffix::Term))
+        } else {
+            let symbol = ScipSymbol::Local(next_local);
+            next_local += 1;
+            symbol
+        };
+        names.insert(id, symbol.clone());
+        definitions.push((site.range, symbol));
+    }
+    definitions
 }
 
 pub fn descriptor(name: &str, suffix: Suffix) -> Descriptor {
@@ -60,344 +91,70 @@ pub fn descriptor(name: &str, suffix: Suffix) -> Descriptor {
     }
 }
 
-enum ScopeKind {
-    Module,
-    Class {
-        /// Names bound directly in the class body, plus `self.x` attributes seen so far.
-        attributes: SmallSet<Name>,
-    },
-    Function {
-        receiver: Option<Name>,
-        globals: SmallSet<Name>,
-        nonlocals: SmallSet<Name>,
-    },
-    /// A comprehension or lambda: every name it binds is a local.
-    Anonymous,
-}
-
-struct Scope {
-    kind: ScopeKind,
-    path: Vec<Descriptor>,
-    names: HashMap<Name, ScipSymbol>,
-}
-
-impl Scope {
-    fn new(kind: ScopeKind, path: Vec<Descriptor>) -> Self {
-        Self {
-            kind,
-            path,
-            names: HashMap::new(),
-        }
-    }
-}
-
-struct Builder {
-    module_path: Vec<Descriptor>,
-    scopes: Vec<Scope>,
-    definitions: Vec<(TextRange, ScipSymbol)>,
-    next_local: usize,
-}
-
 fn child(path: &[Descriptor], name: &str, suffix: Suffix) -> Vec<Descriptor> {
     let mut path = path.to_vec();
     path.push(descriptor(name, suffix));
     path
 }
 
-impl Builder {
-    fn scope(&self) -> &Scope {
-        self.scopes
-            .last()
-            .expect("the module scope is never popped")
-    }
-
-    fn new_local(&mut self) -> ScipSymbol {
-        self.next_local += 1;
-        ScipSymbol::Local(self.next_local - 1)
-    }
-
-    fn define(&mut self, id: &Identifier, symbol: ScipSymbol) {
-        self.definitions.push((id.range, symbol));
-    }
-
-    /// Define a name in the current scope, regardless of any earlier binding of it.
-    fn define_in_scope(&mut self, id: &Identifier, symbol: ScipSymbol) {
-        self.scopes
-            .last_mut()
-            .expect("the module scope is never popped")
-            .names
-            .insert(id.id.clone(), symbol.clone());
-        self.define(id, symbol);
-    }
-
-    /// Define a function or class in the current scope, returning its path.
-    fn declare(&mut self, id: &Identifier, suffix: Suffix) -> Vec<Descriptor> {
-        let path = child(&self.scope().path, &id.id, suffix);
-        self.define_in_scope(id, ScipSymbol::Global(path.clone()));
-        path
-    }
-
-    /// The symbol for binding `name` in scope `index`, creating it on first use.
-    fn binding(&mut self, index: usize, name: &Name) -> ScipSymbol {
-        if let Some(symbol) = self.scopes[index].names.get(name) {
-            return symbol.clone();
-        }
-        let symbol = match &self.scopes[index].kind {
-            ScopeKind::Module | ScopeKind::Class { .. } => {
-                ScipSymbol::Global(child(&self.scopes[index].path, name, Suffix::Term))
-            }
-            ScopeKind::Function { globals, .. } if globals.contains(name) => {
-                ScipSymbol::Global(child(&self.module_path, name, Suffix::Term))
-            }
-            ScopeKind::Function { nonlocals, .. } if nonlocals.contains(name) => {
-                match (0..index)
-                    .rev()
-                    .find(|i| matches!(self.scopes[*i].kind, ScopeKind::Function { .. }))
-                {
-                    Some(enclosing) => self.binding(enclosing, name),
-                    None => self.new_local(),
-                }
-            }
-            ScopeKind::Function { .. } | ScopeKind::Anonymous => self.new_local(),
-        };
-        self.scopes[index]
-            .names
-            .insert(name.clone(), symbol.clone());
-        symbol
-    }
-
-    /// Bind a name in the current scope. A walrus inside a comprehension binds in the enclosing
-    /// scope instead.
-    fn bind(&mut self, id: &Identifier, walrus: bool) {
-        let mut index = self.scopes.len() - 1;
-        if walrus {
-            while index > 0 && matches!(self.scopes[index].kind, ScopeKind::Anonymous) {
-                index -= 1;
-            }
-        }
-        let symbol = self.binding(index, &id.id);
-        self.define(id, symbol);
-    }
-
-    /// `self.x = ...` in a method defines the attribute `x`, unless the class already did.
-    fn bind_attribute(&mut self, attribute: &ExprAttribute) {
-        let [.., class, method] = self.scopes.as_mut_slice() else {
-            return;
-        };
-        let (
-            ScopeKind::Class { attributes },
-            ScopeKind::Function {
-                receiver: Some(receiver),
-                ..
+/// Declaration nesting supplies descriptors, not name resolution. In particular, the
+/// declaration's lexical owner may differ from its syntactic containing scope.
+fn scope_path(
+    inventory: &SymbolInventory,
+    id: ScopeId,
+    module: &[Descriptor],
+) -> Option<Vec<Descriptor>> {
+    let scope = inventory.scope(id);
+    if let Some(declaration) = &scope.declaration {
+        let site = inventory.definition_at(declaration.range)?;
+        // Invalid captures do not acquire a valid descriptor through their containing scope.
+        let owner = inventory.symbol(*site.symbol.as_ref().ok()?).owner;
+        return Some(child(
+            &scope_path(inventory, owner, module)?,
+            &declaration.id,
+            match site.kind {
+                DefinitionKind::Class => Suffix::Type,
+                DefinitionKind::Function => Suffix::Method,
+                _ => unreachable!("a scope is introduced by a class or function declaration"),
             },
-        ) = (&mut class.kind, &method.kind)
-        else {
-            return;
-        };
-        if let Some(attr) = Ast::expr_receiver_attr(attribute, receiver)
-            && attributes.insert(attr.id.clone())
-        {
-            let symbol = ScipSymbol::Global(child(&class.path, &attr.id, Suffix::Term));
-            self.define(attr, symbol);
-        }
+        ));
     }
-
-    fn bind_parameters(&mut self, parameters: &Parameters) {
-        for parameter in parameters.iter() {
-            let id = parameter.name();
-            let symbol = match &self.scope().kind {
-                ScopeKind::Anonymous => self.new_local(),
-                _ => ScipSymbol::Global(child(&self.scope().path, &id.id, Suffix::Parameter)),
-            };
-            self.define_in_scope(id, symbol);
-        }
-    }
-
-    fn visit_comprehensions(&mut self, generators: &[Comprehension], elements: &[&Expr]) {
-        // The first iterable is evaluated in the enclosing scope.
-        if let Some(first) = generators.first() {
-            self.visit_expr(&first.iter);
-        }
-        self.scopes
-            .push(Scope::new(ScopeKind::Anonymous, self.scope().path.clone()));
-        for (i, generator) in generators.iter().enumerate() {
-            if i > 0 {
-                self.visit_expr(&generator.iter);
-            }
-            self.visit_expr(&generator.target);
-            for condition in &generator.ifs {
-                self.visit_expr(condition);
-            }
-        }
-        for element in elements {
-            self.visit_expr(element);
-        }
-        self.scopes.pop();
-    }
-}
-
-impl<'a> SourceOrderVisitor<'a> for Builder {
-    fn visit_stmt(&mut self, stmt: &'a Stmt) {
-        match stmt {
-            Stmt::FunctionDef(function) => {
-                for decorator in &function.decorator_list {
-                    self.visit_decorator(decorator);
-                }
-                self.visit_parameters(&function.parameters);
-                if let Some(returns) = &function.returns {
-                    self.visit_expr(returns);
-                }
-                let path = self.declare(&function.name, Suffix::Method);
-                let receiver = match &self.scope().kind {
-                    ScopeKind::Class { .. } => function
-                        .parameters
-                        .iter_non_variadic_params()
-                        .next()
-                        .map(|p| p.parameter.name.id.clone()),
-                    _ => None,
-                };
-                let (globals, nonlocals) = gather_nonlocal_variables(&function.body);
-                self.scopes.push(Scope::new(
-                    ScopeKind::Function {
-                        receiver,
-                        globals: (*globals).clone(),
-                        nonlocals: (*nonlocals).clone(),
-                    },
-                    path,
-                ));
-                self.bind_parameters(&function.parameters);
-                self.visit_body(&function.body);
-                self.scopes.pop();
-            }
-            Stmt::ClassDef(class) => {
-                for decorator in &class.decorator_list {
-                    self.visit_decorator(decorator);
-                }
-                if let Some(arguments) = &class.arguments {
-                    self.visit_arguments(arguments);
-                }
-                let path = self.declare(&class.name, Suffix::Type);
-                let mut attributes = SmallSet::new();
-                for stmt in &class.body {
-                    match stmt {
-                        Stmt::FunctionDef(x) => {
-                            attributes.insert(x.name.id.clone());
-                        }
-                        Stmt::ClassDef(x) => {
-                            attributes.insert(x.name.id.clone());
-                        }
-                        Stmt::Assign(x) => x.targets.iter().for_each(|t| {
-                            Ast::expr_lvalue(t, &mut |n| {
-                                attributes.insert(n.id.clone());
-                            })
-                        }),
-                        Stmt::AnnAssign(x) => Ast::expr_lvalue(&x.target, &mut |n| {
-                            attributes.insert(n.id.clone());
-                        }),
-                        _ => {}
-                    }
-                }
-                self.scopes
-                    .push(Scope::new(ScopeKind::Class { attributes }, path));
-                self.visit_body(&class.body);
-                self.scopes.pop();
-            }
-            Stmt::AugAssign(assign) => {
-                if !matches!(&*assign.target, Expr::Name(_)) {
-                    self.visit_expr(&assign.target);
-                }
-                self.visit_expr(&assign.value);
-            }
-            _ => walk_stmt(self, stmt),
-        }
-    }
-
-    fn visit_expr(&mut self, expr: &'a Expr) {
-        match expr {
-            Expr::Name(name) if name.ctx == ExprContext::Store => {
-                self.bind(&Ast::expr_name_identifier(name.clone()), false)
-            }
-            Expr::Named(named) => {
-                if let Expr::Name(name) = &*named.target {
-                    self.bind(&Ast::expr_name_identifier(name.clone()), true);
-                }
-                self.visit_expr(&named.value);
-            }
-            Expr::Attribute(attribute) if attribute.ctx == ExprContext::Store => {
-                self.bind_attribute(attribute);
-                self.visit_expr(&attribute.value);
-            }
-            Expr::ListComp(x) => self.visit_comprehensions(&x.generators, &[&x.elt]),
-            Expr::SetComp(x) => self.visit_comprehensions(&x.generators, &[&x.elt]),
-            Expr::Generator(x) => self.visit_comprehensions(&x.generators, &[&x.elt]),
-            Expr::DictComp(x) => {
-                let elements: Vec<&Expr> =
-                    x.key.as_deref().into_iter().chain([&*x.value]).collect();
-                self.visit_comprehensions(&x.generators, &elements)
-            }
-            Expr::Lambda(lambda) => {
-                if let Some(parameters) = &lambda.parameters {
-                    self.visit_parameters(parameters);
-                }
-                self.scopes
-                    .push(Scope::new(ScopeKind::Anonymous, self.scope().path.clone()));
-                if let Some(parameters) = &lambda.parameters {
-                    self.bind_parameters(parameters);
-                }
-                self.visit_expr(&lambda.body);
-                self.scopes.pop();
-            }
-            _ => walk_expr(self, expr),
-        }
-    }
-
-    fn visit_except_handler(&mut self, handler: &'a ExceptHandler) {
-        let ExceptHandler::ExceptHandler(x) = handler;
-        if let Some(name) = &x.name {
-            self.bind(name, false);
-        }
-        walk_except_handler(self, handler);
-    }
-
-    fn visit_pattern(&mut self, pattern: &'a Pattern) {
-        let name = match pattern {
-            Pattern::MatchAs(x) => x.name.as_ref(),
-            Pattern::MatchStar(x) => x.name.as_ref(),
-            Pattern::MatchMapping(x) => x.rest.as_ref(),
-            _ => None,
-        };
-        if let Some(name) = name {
-            self.bind(name, false);
-        }
-        walk_pattern(self, pattern);
+    match scope.parent {
+        Some(parent) => scope_path(inventory, parent, module),
+        None => Some(module.to_vec()),
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use pyrefly_python::ast::Ast;
-    use ruff_python_ast::PySourceType;
     use scip::symbol::format_symbol;
     use scip::types::Symbol;
 
     use super::*;
+    use crate::state::require::Require;
+    use crate::test::util::mk_multi_file_state;
 
     fn symbols(code: &str) -> Vec<(String, String)> {
-        let (ast, _, _) = Ast::parse(code, PySourceType::Python);
-        definitions(ModuleName::from_str("m"), &ast)
-            .iter()
-            .map(|(range, symbol)| {
-                let symbol = match symbol {
-                    ScipSymbol::Global(descriptors) => format_symbol(Symbol {
-                        scheme: "s".to_owned(),
-                        descriptors: descriptors.clone(),
-                        ..Default::default()
-                    }),
-                    ScipSymbol::Local(i) => format!("local {i}"),
-                };
-                (code[*range].to_owned(), symbol)
-            })
-            .collect()
+        let (handles, state) = mk_multi_file_state(&[("m", code)], Require::Everything, false);
+        let transaction = state.transaction();
+        let answers = transaction.get_answers(&handles["m"]).unwrap();
+        definitions(
+            ModuleName::from_str("m"),
+            answers.bindings().symbol_inventory().unwrap(),
+        )
+        .iter()
+        .map(|(range, symbol)| {
+            let symbol = match symbol {
+                ScipSymbol::Global(descriptors) => format_symbol(Symbol {
+                    scheme: "s".to_owned(),
+                    descriptors: descriptors.clone(),
+                    ..Default::default()
+                }),
+                ScipSymbol::Local(i) => format!("local {i}"),
+            };
+            (code[*range].to_owned(), symbol)
+        })
+        .collect()
     }
 
     fn assert_symbols(code: &str, expected: &[(&str, &str)]) {
@@ -450,6 +207,46 @@ class C:
                 ("self", "m/C#__init__().(self)"),
                 ("v", "m/C#__init__().(v)"),
                 ("x", "m/C#x."),
+            ],
+        );
+    }
+
+    #[test]
+    fn test_capture_and_lambda_ownership() {
+        let actual = symbols(
+            r#"
+x = 0
+def outer():
+    value = 1
+    def middle():
+        def writer():
+            nonlocal value
+            value = 2
+callback = lambda: (x := 3)
+"#,
+        );
+        let values: Vec<_> = actual.iter().filter(|(name, _)| name == "value").collect();
+        // The intervening function does not bind `value`; both writes name one local.
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0].1, "local 0");
+        assert_eq!(values[1].1, values[0].1);
+        let xs: Vec<_> = actual.iter().filter(|(name, _)| name == "x").collect();
+        // A lambda is a binding scope for walrus assignments, unlike a comprehension.
+        assert_eq!(xs.len(), 2);
+        assert_eq!(xs[0].1, "s . . . m/x.");
+        assert_eq!(xs[1].1, "local 1");
+    }
+
+    #[test]
+    fn test_reclassified_declarations() {
+        assert_symbols(
+            "x = 0\ndef x(): ...\nx = 1\nclass x: ...\nx = 2\n",
+            &[
+                ("x", "m/x."),
+                ("x", "m/x()."),
+                ("x", "m/x()."),
+                ("x", "m/x#"),
+                ("x", "m/x#"),
             ],
         );
     }

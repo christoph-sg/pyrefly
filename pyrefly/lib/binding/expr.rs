@@ -1143,6 +1143,7 @@ impl<'a> BindingsBuilder<'a> {
                         Hashed::new(&name.id),
                         idx,
                         FlowStyle::Other,
+                        name.range,
                     );
                 }
             }

@@ -22,5 +22,6 @@ pub mod pytest;
 pub mod scope;
 pub mod shape_type;
 pub mod stmt;
+pub mod symbols;
 pub mod table;
 pub mod target;

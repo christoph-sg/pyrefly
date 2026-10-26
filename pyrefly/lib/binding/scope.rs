@@ -70,7 +70,14 @@ use crate::binding::bindings::CurrentIdx;
 use crate::binding::bindings::InitializedInFlow;
 use crate::binding::expr::Usage;
 use crate::binding::function::SelfAssignments;
+use crate::binding::metadata::BindingsMetadata;
 use crate::binding::narrow::NarrowOps;
+use crate::binding::symbols::DefinitionKind;
+use crate::binding::symbols::ScopeId;
+use crate::binding::symbols::ScopeInfo;
+use crate::binding::symbols::SymbolInventory;
+use crate::binding::symbols::SymbolInventoryBuilder;
+use crate::binding::symbols::SymbolScopeKind;
 use crate::export::definitions::Definition;
 use crate::export::definitions::DefinitionStyle;
 use crate::export::definitions::Definitions;
@@ -232,6 +239,9 @@ struct Static(SmallMap<Name, StaticInfo>);
 struct StaticInfo {
     range: TextRange,
     style: StaticStyle,
+    /// Lexical ownership is independent of subsequent changes to the type-checking style.
+    /// Populated only when retaining a symbol inventory.
+    owner: Option<Result<ScopeId, MutableCaptureError>>,
     /// The range of the textually last assignment to this name. Used to check
     /// whether a captured variable is reassigned after a nested function definition.
     last_range: TextRange,
@@ -452,6 +462,7 @@ impl Static {
                 e.insert(StaticInfo {
                     range,
                     style,
+                    owner: None,
                     last_range,
                     char_len,
                     char_mask,
@@ -1380,6 +1391,7 @@ impl<'a, I: Iterator<Item = (usize, &'a Scope)>> Iterator for ScopeViews<I> {
 #[derive(Clone, Debug)]
 pub struct Scope {
     range: TextRange,
+    inventory_id: Option<ScopeId>,
     /// Things that are defined in this scope, statically, e.g. `x = 1` or `def f():`.
     /// Populated at the beginning before entering the scope.
     stat: Static,
@@ -1438,6 +1450,7 @@ impl Scope {
     fn new(range: TextRange, flow_barrier: FlowBarrier, kind: ScopeKind) -> Self {
         Self {
             range,
+            inventory_id: None,
             stat: Default::default(),
             flow: Default::default(),
             flow_barrier,
@@ -1598,6 +1611,7 @@ impl ScopeTreeNode {
 #[derive(Clone, Debug)]
 pub struct Scopes {
     scopes: Vec1<ScopeTreeNode>,
+    inventory: Option<SymbolInventoryBuilder>,
     /// When `keep_scope_tree` flag is on, the stack will maintain a tree of all the scopes
     /// throughout the program, even if the scope has already been popped. This is useful
     /// for autocomplete purposes.
@@ -1608,12 +1622,23 @@ pub struct Scopes {
 
 impl Scopes {
     pub fn module(range: TextRange, keep_scope_tree: bool, is_interface: bool) -> Self {
-        let module_scope = Scope::module(range);
+        let mut module_scope = Scope::module(range);
+        let inventory = keep_scope_tree.then(|| {
+            let mut inventory = SymbolInventoryBuilder::default();
+            module_scope.inventory_id = Some(inventory.push_scope(ScopeInfo {
+                kind: SymbolScopeKind::Module,
+                parent: None,
+                range,
+                declaration: None,
+            }));
+            inventory
+        });
         Self {
             scopes: Vec1::new(ScopeTreeNode {
                 scope: module_scope,
                 children: Vec::new(),
             }),
+            inventory,
             keep_scope_tree,
             is_interface,
         }
@@ -1621,6 +1646,10 @@ impl Scopes {
 
     fn current(&self) -> &Scope {
         &self.scopes.last().scope
+    }
+
+    pub fn has_symbol_inventory(&self) -> bool {
+        self.inventory.is_some()
     }
 
     pub fn clone_current_flow(&self) -> Flow {
@@ -1942,10 +1971,14 @@ impl Scopes {
     }
 
     /// There is only one scope remaining, return it.
-    pub fn finish(self) -> ScopeTrace {
+    pub fn finish(self, metadata: &BindingsMetadata, table: &BindingTable) -> ScopeTrace {
         let (a, b) = self.scopes.split_off_last();
         assert_eq!(a.len(), 0);
-        ScopeTrace(b)
+        ScopeTrace(
+            b,
+            self.inventory
+                .map(|inventory| inventory.finish(metadata, table)),
+        )
     }
 
     pub fn has_import_name(&self, name: &Name) -> bool {
@@ -1974,6 +2007,7 @@ impl Scopes {
         sys_info: SysInfo,
         get_annotation_idx: &mut impl FnMut(ShortIdentifier) -> Idx<KeyAnnotation>,
     ) {
+        let module_owner = self.scopes.first().scope.inventory_id;
         let mut initialize = |scope: &mut Scope, myself: Option<&Self>| {
             let (implicit_captures, shadowed_implicit_builtins, final_names, final_string_values) =
                 scope.stat.stmts(
@@ -1989,6 +2023,29 @@ impl Scopes {
             scope.shadowed_implicit_builtins = shadowed_implicit_builtins;
             scope.final_names = final_names;
             scope.final_string_values = final_string_values;
+            if let Some(owner) = scope.inventory_id {
+                for info in scope.stat.0.values_mut() {
+                    info.owner = Some(match &info.style {
+                        StaticStyle::MutableCapture(capture) => match &capture.original {
+                            Ok(original) if capture.kind == MutableCaptureKind::Nonlocal => {
+                                original
+                                    .owner
+                                    .clone()
+                                    .expect("enclosing static has lexical ownership")
+                            }
+                            Ok(_) => Ok(module_owner.expect("module has an inventory scope")),
+                            Err(_)
+                                if capture.kind == MutableCaptureKind::Global
+                                    && capture.has_value_definition =>
+                            {
+                                Ok(module_owner.expect("module has an inventory scope"))
+                            }
+                            Err(error) => Err(error.clone()),
+                        },
+                        _ => Ok(owner),
+                    });
+                }
+            }
             // Presize the flow, as its likely to need as much space as static.
             scope.flow.info.reserve(scope.stat.0.len());
         };
@@ -2031,7 +2088,36 @@ impl Scopes {
         None
     }
 
-    pub fn push(&mut self, scope: Scope) {
+    pub fn push(&mut self, mut scope: Scope) {
+        let parent = self.current().inventory_id;
+        if scope.inventory_id.is_none()
+            && let Some(inventory) = &mut self.inventory
+        {
+            let (kind, declaration) = match &scope.kind {
+                ScopeKind::Module => (SymbolScopeKind::Module, None),
+                ScopeKind::Class(class) => (
+                    SymbolScopeKind::Class(class.indices.def_index),
+                    Some(class.name.clone()),
+                ),
+                ScopeKind::Function(function) => {
+                    if scope.flow_barrier == FlowBarrier::AllowFlowUnchecked {
+                        (SymbolScopeKind::Lambda, None)
+                    } else {
+                        (SymbolScopeKind::Function, Some(function.name.clone()))
+                    }
+                }
+                ScopeKind::Method(method) => (SymbolScopeKind::Function, Some(method.name.clone())),
+                ScopeKind::Comprehension { .. } => (SymbolScopeKind::Comprehension, None),
+                ScopeKind::Annotation { .. } => (SymbolScopeKind::Annotation, None),
+                ScopeKind::TypeAlias => (SymbolScopeKind::TypeAlias, None),
+            };
+            scope.inventory_id = Some(inventory.push_scope(ScopeInfo {
+                kind,
+                parent,
+                range: scope.range,
+                declaration,
+            }));
+        }
         self.scopes.push(ScopeTreeNode {
             scope,
             children: Vec::new(),
@@ -2457,10 +2543,12 @@ impl Scopes {
         name: Hashed<&Name>,
         idx: Idx<Key>,
         style: FlowStyle,
+        range: TextRange,
     ) {
         let len = self.scopes.len();
         for i in (0..len - 1).rev() {
             if !matches!(self.scopes[i].scope.kind, ScopeKind::Comprehension { .. }) {
+                self.record_definition_in_scope(i, name.key(), range, DefinitionKind::Assignment);
                 let in_loop = !self.scopes[i].scope.loops.is_empty();
                 match self.scopes[i].scope.flow.info.entry_hashed(name.cloned()) {
                     Entry::Vacant(e) => {
@@ -2654,9 +2742,49 @@ impl Scopes {
     }
 
     fn add_to_current_static(&mut self, name: &Identifier, style: StaticStyle) {
-        self.current_mut()
+        let scope = self.current_mut();
+        scope
             .stat
-            .upsert(Hashed::new(name.id.clone()), name.range, style, name.range)
+            .upsert(Hashed::new(name.id.clone()), name.range, style, name.range);
+        if let Some(owner) = scope.inventory_id {
+            scope
+                .stat
+                .0
+                .get_mut(&name.id)
+                .expect("just inserted")
+                .owner
+                .get_or_insert(Ok(owner));
+        }
+    }
+
+    /// Record an actual source definition, not a flow narrow or an implicit capture seed.
+    pub fn record_definition(&mut self, name: &Name, range: TextRange, kind: DefinitionKind) {
+        self.record_definition_in_scope(self.scopes.len() - 1, name, range, kind);
+    }
+
+    fn record_definition_in_scope(
+        &mut self,
+        index: usize,
+        name: &Name,
+        range: TextRange,
+        kind: DefinitionKind,
+    ) {
+        let Some(inventory) = &mut self.inventory else {
+            return;
+        };
+        let scope = &self.scopes[index].scope;
+        let owner = scope
+            .stat
+            .0
+            .get(name)
+            .and_then(|info| info.owner.clone())
+            // Comprehension targets and walrus names can be discovered during binding.
+            .unwrap_or_else(|| {
+                Ok(scope
+                    .inventory_id
+                    .expect("inventory scope is assigned on push"))
+            });
+        inventory.record(name, owner, range, kind);
     }
 
     /// Add a parameter to the current static.
@@ -3584,6 +3712,7 @@ impl Scopes {
                             Ok(Box::new(StaticInfo {
                                 range: TextRange::default(),
                                 style: StaticStyle::ImplicitBuiltinImport(module),
+                                owner: None,
                                 last_range: TextRange::default(),
                                 char_len,
                                 char_mask,
@@ -3665,9 +3794,13 @@ impl Scopes {
 }
 
 #[derive(Clone, Debug)]
-pub struct ScopeTrace(ScopeTreeNode);
+pub struct ScopeTrace(ScopeTreeNode, Option<SymbolInventory>);
 
 impl ScopeTrace {
+    pub fn symbol_inventory(&self) -> Option<&SymbolInventory> {
+        self.1.as_ref()
+    }
+
     pub fn toplevel_scope(&self) -> &Scope {
         &self.0.scope
     }

@@ -116,6 +116,8 @@ use crate::binding::scope::fallback_builtin_modules;
 use crate::binding::scope::is_constant_name;
 use crate::binding::shape_type::ShapeDeclarations;
 use crate::binding::shape_type::TypeParameterBound;
+use crate::binding::symbols::DefinitionKind;
+use crate::binding::symbols::SymbolInventory;
 use crate::binding::table::TableKeyed;
 use crate::config::base::InferReturnTypes;
 use crate::config::error_kind::ErrorKind;
@@ -514,6 +516,11 @@ impl Bindings {
         }
     }
 
+    /// Lexical ownership and definition sites, retained under `Require::Everything`.
+    pub fn symbol_inventory(&self) -> Option<&SymbolInventory> {
+        self.scope_trace.as_ref()?.symbol_inventory()
+    }
+
     pub fn definition_at_position(&self, position: TextSize) -> Option<&Key> {
         if let Some(trace) = &self.scope_trace {
             trace.definition_at_position(&self.table, position)
@@ -753,7 +760,7 @@ impl Bindings {
 
         let unused_imports = builder.scopes.collect_module_unused_imports();
         builder.record_unused_imports(unused_imports);
-        let scope_trace = builder.scopes.finish();
+        let scope_trace = builder.scopes.finish(&builder.metadata, &builder.table);
 
         let semantic_errors = builder.semantic_syntax_errors.into_inner();
         for error in semantic_errors {
@@ -2153,6 +2160,18 @@ impl<'a> BindingsBuilder<'a> {
         // The definitions phase already skips them, so they won't be in the static scope.
         if name.is_empty() {
             return None;
+        }
+        if self.scopes.has_symbol_inventory()
+            && matches!(self.idx_to_key(idx), Key::Definition(_) | Key::Import(_))
+        {
+            let range = self.idx_to_key(idx).range();
+            let kind = match style {
+                FlowStyle::Import(..)
+                | FlowStyle::ImportAs(..)
+                | FlowStyle::MergeableImport(..) => DefinitionKind::Import,
+                _ => DefinitionKind::Assignment,
+            };
+            self.scopes.record_definition(name, range, kind);
         }
         // Suppress the ALL_CAPS check when a more specific check already reported
         // on this reassignment, to avoid emitting two overlapping errors. Both

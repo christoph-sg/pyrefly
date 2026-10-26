@@ -21,7 +21,6 @@ use ruff_python_ast::ModModule;
 use ruff_text_size::Ranged;
 use ruff_text_size::TextSize;
 
-use crate::report::glean::convert::ScopeType;
 use crate::report::glean::convert::compute_scope;
 use crate::report::glean::convert::join_names;
 use crate::state::lsp::DefinitionMetadata;
@@ -111,7 +110,7 @@ fn qualified_name_at_position(
     // e.g. for `def outer(): def inner(): pass`, after this loop
     // container = "mymod.outer" and is_function = true.
     for (scope_name, scope_is_function) in &scopes {
-        let scope = compute_scope(&container, is_function, &ScopeType::Local, &module_str);
+        let scope = compute_scope(&container, is_function);
         container = join_names(&scope, scope_name);
         is_function = *scope_is_function;
     }
@@ -119,7 +118,7 @@ fn qualified_name_at_position(
     // Now attach the target symbol to the container we built.
     // e.g. compute_scope inserts .<locals> because the container is a function,
     // giving us "mymod.outer.<locals>.inner".
-    let scope = compute_scope(&container, is_function, &ScopeType::Local, &module_str);
+    let scope = compute_scope(&container, is_function);
     join_names(&scope, name)
 }
 

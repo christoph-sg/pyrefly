@@ -507,9 +507,10 @@ impl Indexer<'_> {
             return Some(definitions.dupe());
         }
         let handle = Handle::new(module.name(), module.path().dupe(), sys_info);
-        let ast = self.transaction.get_ast(&handle)?;
+        let answers = self.transaction.get_answers(&handle)?;
+        let inventory = answers.bindings().symbol_inventory()?;
         let table: Arc<SmallMap<_, _>> =
-            Arc::new(definitions(module.name(), &ast).into_iter().collect());
+            Arc::new(definitions(module.name(), inventory).into_iter().collect());
         self.definitions.lock().insert(key, table.dupe());
         Some(table)
     }
