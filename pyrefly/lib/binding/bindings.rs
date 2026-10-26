@@ -760,7 +760,7 @@ impl Bindings {
 
         let unused_imports = builder.scopes.collect_module_unused_imports();
         builder.record_unused_imports(unused_imports);
-        let scope_trace = builder.scopes.finish(&builder.metadata);
+        let scope_trace = builder.scopes.finish(&builder.metadata, &builder.table);
 
         let semantic_errors = builder.semantic_syntax_errors.into_inner();
         for error in semantic_errors {
@@ -2165,21 +2165,11 @@ impl<'a> BindingsBuilder<'a> {
             && matches!(self.idx_to_key(idx), Key::Definition(_) | Key::Import(_))
         {
             let range = self.idx_to_key(idx).range();
-            let kind = match self.idx_to_binding(idx) {
-                Some(Binding::Function { .. }) => DefinitionKind::Function,
-                Some(Binding::TypeParameter(..)) => DefinitionKind::TypeParameter,
-                Some(
-                    Binding::FunctionParameter(..)
-                    | Binding::LambdaParameter(..)
-                    | Binding::TypeLevelLambdaParameter(..),
-                ) => DefinitionKind::Parameter,
-                Some(Binding::AugAssign(..)) => DefinitionKind::AugmentedAssignment,
-                _ => match style {
-                    FlowStyle::Import(..)
-                    | FlowStyle::ImportAs(..)
-                    | FlowStyle::MergeableImport(..) => DefinitionKind::Import,
-                    _ => DefinitionKind::Assignment,
-                },
+            let kind = match style {
+                FlowStyle::Import(..)
+                | FlowStyle::ImportAs(..)
+                | FlowStyle::MergeableImport(..) => DefinitionKind::Import,
+                _ => DefinitionKind::Assignment,
             };
             self.scopes.record_definition(name, range, kind);
         }

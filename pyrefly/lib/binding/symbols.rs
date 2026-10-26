@@ -8,11 +8,15 @@
 //! Lexical bindings and their definition occurrences, independent of inferred types.
 //! IDs are local to one module analysis and must not be persisted across rebuilds.
 
+use pyrefly_python::short_identifier::ShortIdentifier;
 use ruff_python_ast::Identifier;
 use ruff_python_ast::name::Name;
 use ruff_text_size::TextRange;
 use starlark_map::small_map::SmallMap;
 
+use crate::binding::binding::Binding;
+use crate::binding::binding::Key;
+use crate::binding::bindings::BindingTable;
 use crate::binding::metadata::BindingsMetadata;
 use crate::binding::scope::MutableCaptureError;
 use crate::types::class::ClassDefIndex;
@@ -73,13 +77,10 @@ pub struct DefinitionSite {
     pub kind: DefinitionKind,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct SymbolInventory {
     scopes: Vec<ScopeInfo>,
     symbols: Vec<BindingSymbol>,
-    by_owner: SmallMap<(ScopeId, Name), BindingSymbolId>,
-    /// Multiple names can share a source range, for example in a wildcard import.
-    by_definition: SmallMap<(TextRange, Name), usize>,
     definitions: Vec<DefinitionSite>,
 }
 
@@ -118,7 +119,18 @@ impl SymbolInventory {
     pub fn symbol(&self, id: BindingSymbolId) -> &BindingSymbol {
         &self.symbols[id.0]
     }
+}
 
+/// Record ownership while binding; assign lexical IDs only after all writes are known.
+#[derive(Clone, Debug, Default)]
+pub(super) struct SymbolInventoryBuilder {
+    scopes: Vec<ScopeInfo>,
+    /// Multiple names can share a source range, for example in a wildcard import.
+    definitions:
+        SmallMap<(TextRange, Name), (Result<ScopeId, MutableCaptureError>, DefinitionKind)>,
+}
+
+impl SymbolInventoryBuilder {
     pub(super) fn push_scope(&mut self, info: ScopeInfo) -> ScopeId {
         let id = ScopeId(self.scopes.len());
         self.scopes.push(info);
@@ -135,67 +147,91 @@ impl SymbolInventory {
         if range.is_empty() || name.is_empty() {
             return;
         }
-        let symbol = owner.map(|owner| {
-            *self
-                .by_owner
-                .entry((owner, name.clone()))
-                .or_insert_with(|| {
-                    let id = BindingSymbolId(self.symbols.len());
-                    self.symbols.push(BindingSymbol {
-                        name: name.clone(),
-                        owner,
-                    });
-                    id
-                })
-        });
-        let site = DefinitionSite {
-            symbol,
-            range,
-            kind,
-        };
-        if let Some(index) = self.by_definition.get(&(range, name.clone())) {
-            self.definitions[*index] = site;
-        } else {
-            self.by_definition
-                .insert((range, name.clone()), self.definitions.len());
-            self.definitions.push(site);
-        }
+        // A comprehension walrus first binds in the comprehension, then records its
+        // enclosing owner. Replacing the occurrence does not create an orphan symbol.
+        self.definitions
+            .insert((range, name.clone()), (owner, kind));
     }
 
-    pub(super) fn finish(&mut self, metadata: &BindingsMetadata) {
+    pub(super) fn finish(
+        mut self,
+        metadata: &BindingsMetadata,
+        table: &BindingTable,
+    ) -> SymbolInventory {
         // ClassFields selects the declaration site, including receiver assignments. Do not
         // rediscover fields or confuse this binding-time information with inherited attributes.
-        for i in 0..self.scopes.len() {
-            if let SymbolScopeKind::Class(class) = self.scopes[i].kind {
+        for (i, scope) in self.scopes.iter().enumerate() {
+            if let SymbolScopeKind::Class(class) = scope.kind {
+                // Only a syntactic class declaration introduces a class scope. Functional
+                // factories also produce Binding::ClassDef, but remain assignments.
+                if let Some(declaration) = &scope.declaration
+                    && let Some((_, kind)) = self
+                        .definitions
+                        .get_mut(&(declaration.range, declaration.id.clone()))
+                {
+                    *kind = DefinitionKind::Class;
+                }
                 let fields = &metadata.get_class(class).fields;
                 for name in fields.fields() {
                     let range = fields
                         .field_decl_range(name)
                         .expect("a field has a declaration");
-                    if !self.by_definition.contains_key(&(range, name.clone())) {
-                        self.record(name, Ok(ScopeId(i)), range, DefinitionKind::Field);
+                    if !range.is_empty() && !name.is_empty() {
+                        self.definitions
+                            .entry((range, name.clone()))
+                            .or_insert((Ok(ScopeId(i)), DefinitionKind::Field));
                     }
                 }
             }
         }
-        self.definitions
-            .sort_by_key(|site| (site.range.start(), site.range.end()));
-        // Walrus binding first updates the comprehension flow, then records the enclosing
-        // owner. Retain only lexical symbols referenced by the final definition sites.
-        let mut remap = SmallMap::new();
+        let mut occurrences: Vec<_> = self.definitions.into_iter().collect();
+        occurrences.sort_by_key(|((range, _), _)| (range.start(), range.end()));
+        let mut by_owner = SmallMap::new();
         let mut symbols = Vec::new();
-        for site in &mut self.definitions {
-            if let Ok(id) = &mut site.symbol {
-                *id = *remap.entry(*id).or_insert_with(|| {
-                    let new_id = BindingSymbolId(symbols.len());
-                    symbols.push(self.symbols[id.0].clone());
-                    new_id
+        let definitions = occurrences
+            .into_iter()
+            .map(|((range, name), (owner, kind))| {
+                // Some bindings, notably augmented assignments, are populated after the write.
+                // Read their final kind without coupling lexical identity to a binding key.
+                let kind = if kind == DefinitionKind::Assignment {
+                    let key = Key::Definition(ShortIdentifier::from_text_range(range));
+                    match table
+                        .types
+                        .0
+                        .key_to_idx(&key)
+                        .and_then(|idx| table.types.1.get(idx))
+                    {
+                        Some(Binding::Function { .. }) => DefinitionKind::Function,
+                        Some(Binding::TypeParameter(..)) => DefinitionKind::TypeParameter,
+                        Some(
+                            Binding::FunctionParameter(..)
+                            | Binding::LambdaParameter(..)
+                            | Binding::TypeLevelLambdaParameter(..),
+                        ) => DefinitionKind::Parameter,
+                        Some(Binding::AugAssign(..)) => DefinitionKind::AugmentedAssignment,
+                        _ => kind,
+                    }
+                } else {
+                    kind
+                };
+                let symbol = owner.map(|owner| {
+                    *by_owner.entry((owner, name.clone())).or_insert_with(|| {
+                        let id = BindingSymbolId(symbols.len());
+                        symbols.push(BindingSymbol { name, owner });
+                        id
+                    })
                 });
-            }
+                DefinitionSite {
+                    symbol,
+                    range,
+                    kind,
+                }
+            })
+            .collect();
+        SymbolInventory {
+            scopes: self.scopes,
+            symbols,
+            definitions,
         }
-        self.symbols = symbols;
-        // These lookups are only needed while building the inventory.
-        self.by_owner = SmallMap::new();
-        self.by_definition = SmallMap::new();
     }
 }

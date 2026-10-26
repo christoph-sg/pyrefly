@@ -76,6 +76,7 @@ use crate::binding::symbols::DefinitionKind;
 use crate::binding::symbols::ScopeId;
 use crate::binding::symbols::ScopeInfo;
 use crate::binding::symbols::SymbolInventory;
+use crate::binding::symbols::SymbolInventoryBuilder;
 use crate::binding::symbols::SymbolScopeKind;
 use crate::export::definitions::Definition;
 use crate::export::definitions::DefinitionStyle;
@@ -1610,7 +1611,7 @@ impl ScopeTreeNode {
 #[derive(Clone, Debug)]
 pub struct Scopes {
     scopes: Vec1<ScopeTreeNode>,
-    inventory: Option<SymbolInventory>,
+    inventory: Option<SymbolInventoryBuilder>,
     /// When `keep_scope_tree` flag is on, the stack will maintain a tree of all the scopes
     /// throughout the program, even if the scope has already been popped. This is useful
     /// for autocomplete purposes.
@@ -1623,7 +1624,7 @@ impl Scopes {
     pub fn module(range: TextRange, keep_scope_tree: bool, is_interface: bool) -> Self {
         let mut module_scope = Scope::module(range);
         let inventory = keep_scope_tree.then(|| {
-            let mut inventory = SymbolInventory::default();
+            let mut inventory = SymbolInventoryBuilder::default();
             module_scope.inventory_id = Some(inventory.push_scope(ScopeInfo {
                 kind: SymbolScopeKind::Module,
                 parent: None,
@@ -1970,13 +1971,14 @@ impl Scopes {
     }
 
     /// There is only one scope remaining, return it.
-    pub fn finish(mut self, metadata: &BindingsMetadata) -> ScopeTrace {
-        if let Some(inventory) = &mut self.inventory {
-            inventory.finish(metadata);
-        }
+    pub fn finish(self, metadata: &BindingsMetadata, table: &BindingTable) -> ScopeTrace {
         let (a, b) = self.scopes.split_off_last();
         assert_eq!(a.len(), 0);
-        ScopeTrace(b, self.inventory)
+        ScopeTrace(
+            b,
+            self.inventory
+                .map(|inventory| inventory.finish(metadata, table)),
+        )
     }
 
     pub fn has_import_name(&self, name: &Name) -> bool {

@@ -1231,11 +1231,6 @@ impl<'a> BindingsBuilder<'a> {
                         let ann = self.bind_current(&name.id, &assigned, FlowStyle::Other);
                         let binding = Binding::AugAssign(ann, Box::new(x.clone()));
                         self.insert_binding_current(assigned, binding);
-                        self.scopes.record_definition(
-                            &name.id,
-                            name.range,
-                            DefinitionKind::AugmentedAssignment,
-                        );
                     }
                     Expr::Attribute(attr) => {
                         let mut x_cloned = x.clone();
